@@ -32,7 +32,7 @@ from monai.data import (
 )
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
-from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.metrics import DiceMetric, HausdorffDistanceMetric, SurfaceDiceMetric
 from monai.transforms import (
     AsDiscrete,
     Compose,
@@ -84,6 +84,7 @@ def parse_args():
     parser.add_argument("--pixdim", type=float, nargs=3, default=[1.5, 1.5, 2.0])
     parser.add_argument("--roi_size", type=int, nargs=3, default=[96, 96, 96])
     parser.add_argument("--num_classes", type=int, default=14)
+    parser.add_argument("--nsd_tol_mm", type=float, default=1.0, help="NSD tolerance in mm")
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=2, help="RandCropByPosNegLabeld num_samples")
@@ -441,6 +442,46 @@ def dice_per_class_onehot(
 
 
 @torch.no_grad()
+def compute_hd95_nsd_per_case(
+    pred_case: torch.Tensor,
+    true_case: torch.Tensor,
+    pixdim: Tuple[float, float, float],
+    fg_classes: int,
+    nsd_tol_mm: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nsd_thresholds = [float(nsd_tol_mm)] * fg_classes
+    tmp_nsd = SurfaceDiceMetric(
+        class_thresholds=nsd_thresholds,
+        include_background=False,
+        reduction="none",
+        get_not_nans=False,
+        use_subvoxels=True,
+    )
+    tmp_nsd(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+    nsd_case = tmp_nsd.aggregate()
+    tmp_nsd.reset()
+
+    tmp_hd95 = HausdorffDistanceMetric(
+        include_background=False,
+        reduction="none",
+        percentile=95,
+        get_not_nans=False,
+    )
+    tmp_hd95(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+    hd95_case = tmp_hd95.aggregate()
+    tmp_hd95.reset()
+
+    if isinstance(nsd_case, (tuple, list)):
+        nsd_case = nsd_case[0]
+    if isinstance(hd95_case, (tuple, list)):
+        hd95_case = hd95_case[0]
+
+    nsd_case = nsd_case.squeeze(0).detach().cpu().float()
+    hd95_case = hd95_case.squeeze(0).detach().cpu().float()
+    return hd95_case, nsd_case
+
+
+@torch.no_grad()
 def run_evaluation_single_model(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -456,19 +497,19 @@ def run_evaluation_single_model(
     writer: Optional[SummaryWriter] = None,
     prefix: str = "val",
     compute_hd95: bool = False,
+    compute_nsd: bool = False,
+    pixdim: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    nsd_tol_mm: float = 1.0,
 ) -> Dict[str, Any]:
     model.eval()
 
     dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=True)
 
-    hd95_metric = None
-    if compute_hd95:
-        hd95_metric = HausdorffDistanceMetric(
-            include_background=False,
-            reduction="mean_batch",
-            percentile=95,
-            get_not_nans=True,
-        )
+    fg_classes = max(num_classes - 1, 0)
+    sum_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    sum_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
 
     pbar = tqdm(loader, desc=f"{prefix.upper()}@{global_step}", dynamic_ncols=True)
     for batch in pbar:
@@ -491,8 +532,26 @@ def run_evaluation_single_model(
         outputs_convert = [post_pred(x) for x in outputs_list]
 
         dice_metric(y_pred=outputs_convert, y=labels_convert)
-        if hd95_metric is not None:
-            hd95_metric(y_pred=outputs_convert, y=labels_convert)
+
+        if (compute_hd95 or compute_nsd) and fg_classes > 0:
+            for pred_case, true_case in zip(outputs_convert, labels_convert):
+                hd95_case, nsd_case = compute_hd95_nsd_per_case(
+                    pred_case=pred_case,
+                    true_case=true_case,
+                    pixdim=pixdim,
+                    fg_classes=fg_classes,
+                    nsd_tol_mm=nsd_tol_mm,
+                )
+                if compute_hd95:
+                    hd95_case = hd95_case.to(torch.float64)
+                    valid_hd = ~torch.isnan(hd95_case)
+                    sum_hd95 += torch.nan_to_num(hd95_case, nan=0.0)
+                    cnt_hd95 += valid_hd.to(torch.float64)
+                if compute_nsd:
+                    nsd_case = nsd_case.to(torch.float64)
+                    valid_nsd = ~torch.isnan(nsd_case)
+                    sum_nsd += torch.nan_to_num(nsd_case, nan=0.0)
+                    cnt_nsd += valid_nsd.to(torch.float64)
 
     dice_agg = dice_metric.aggregate()
     dice_metric.reset()
@@ -500,23 +559,28 @@ def run_evaluation_single_model(
     dice_per_class = dice_agg[0] if isinstance(dice_agg, (tuple, list)) else dice_agg
     dice_per_class = dice_per_class.detach().float().cpu()
 
-    if hd95_metric is not None:
-        hd_agg = hd95_metric.aggregate()
-        hd95_metric.reset()
-        hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
-        hd95_per_class = hd95_per_class.detach().float().cpu()
-    else:
-        hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float32)
+    hd95_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+    nsd_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+
+    if compute_hd95 and fg_classes > 0:
+        valid_hd = cnt_hd95 > 0
+        hd95_per_class[valid_hd] = (sum_hd95[valid_hd] / cnt_hd95[valid_hd]).float()
+    if compute_nsd and fg_classes > 0:
+        valid_nsd = cnt_nsd > 0
+        nsd_per_class[valid_nsd] = (sum_nsd[valid_nsd] / cnt_nsd[valid_nsd]).float()
 
     dice_mean_incl_bg = float(torch.nanmean(dice_per_class).item())
     dice_mean_fg = float(torch.nanmean(dice_per_class[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
     hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
+    nsd_mean_excl_bg = float(torch.nanmean(nsd_per_class).item()) if nsd_per_class.numel() > 0 else float("nan")
 
     if writer is not None:
         writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
         writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
         if compute_hd95:
             writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        if compute_nsd:
+            writer.add_scalar(f"{prefix}/nsd_mean_excl_bg", nsd_mean_excl_bg, global_step)
 
         for c in range(num_classes):
             writer.add_scalar(
@@ -532,13 +596,22 @@ def run_evaluation_single_model(
                     float(hd95_per_class[idx].item()),
                     global_step,
                 )
+        if compute_nsd:
+            for idx in range(nsd_per_class.numel()):
+                writer.add_scalar(
+                    f"{prefix}/per_class_nsd/{class_names[idx + 1]}",
+                    float(nsd_per_class[idx].item()),
+                    global_step,
+                )
 
     return {
         "dice_mean_incl_bg": dice_mean_incl_bg,
         "dice_mean_fg": dice_mean_fg,
         "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "nsd_mean_excl_bg": nsd_mean_excl_bg,
         "dice_per_class_incl_bg": dice_per_class,
         "hd95_per_class_excl_bg": hd95_per_class,
+        "nsd_per_class_excl_bg": nsd_per_class,
     }
 
 
@@ -559,6 +632,9 @@ def run_test_single_model_and_print_cases(
     writer: Optional[SummaryWriter] = None,
     prefix: str = "test",
     compute_hd95: bool = True,
+    compute_nsd: bool = True,
+    pixdim: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    nsd_tol_mm: float = 1.0,
 ) -> Dict[str, Any]:
     assert os.path.isfile(ckpt_path), f"checkpoint not found: {ckpt_path}"
 
@@ -569,14 +645,11 @@ def run_test_single_model_and_print_cases(
     sum_dice = torch.zeros((num_classes,), dtype=torch.float64)
     cnt_dice = torch.zeros((num_classes,), dtype=torch.float64)
 
-    hd95_metric = None
-    if compute_hd95:
-        hd95_metric = HausdorffDistanceMetric(
-            include_background=False,
-            reduction="mean_batch",
-            percentile=95,
-            get_not_nans=True,
-        )
+    fg_classes = max(num_classes - 1, 0)
+    sum_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    sum_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
 
     case_rows: List[Dict[str, Any]] = []
 
@@ -609,14 +682,34 @@ def run_test_single_model_and_print_cases(
         sum_dice += torch.nan_to_num(dice_c_cpu, nan=0.0)
         cnt_dice += mask.double()
 
-        if hd95_metric is not None:
-            hd95_metric(y_pred=preds_1hot_list, y=labels_1hot_list)
+        hd95_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+        nsd_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+        if (compute_hd95 or compute_nsd) and fg_classes > 0:
+            hd95_case, nsd_case = compute_hd95_nsd_per_case(
+                pred_case=preds_1hot_list[0],
+                true_case=labels_1hot_list[0],
+                pixdim=pixdim,
+                fg_classes=fg_classes,
+                nsd_tol_mm=nsd_tol_mm,
+            )
+            if compute_hd95:
+                hd95_case_f64 = hd95_case.to(torch.float64)
+                valid_hd = ~torch.isnan(hd95_case_f64)
+                sum_hd95 += torch.nan_to_num(hd95_case_f64, nan=0.0)
+                cnt_hd95 += valid_hd.to(torch.float64)
+            if compute_nsd:
+                nsd_case_f64 = nsd_case.to(torch.float64)
+                valid_nsd = ~torch.isnan(nsd_case_f64)
+                sum_nsd += torch.nan_to_num(nsd_case_f64, nan=0.0)
+                cnt_nsd += valid_nsd.to(torch.float64)
 
         case_rows.append(
             {
                 "case_id": case_id,
                 "dice_mean_fg": dice_fg,
                 "dice_per_class_incl_bg": tensor_to_float_list(dice_c.detach().cpu().float()),
+                "hd95_per_class_excl_bg": tensor_to_float_list(hd95_case),
+                "nsd_per_class_excl_bg": tensor_to_float_list(nsd_case),
             }
         )
 
@@ -630,16 +723,17 @@ def run_test_single_model_and_print_cases(
     dice_mean_incl_bg = float(torch.nanmean(dice_per_class_mean_f32).item())
     dice_mean_fg = float(torch.nanmean(dice_per_class_mean_f32[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
 
-    if hd95_metric is not None:
-        hd_agg = hd95_metric.aggregate()
-        hd95_metric.reset()
-        hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
-        hd95_per_class = hd95_per_class.detach().float().cpu()
-        hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
-    else:
-        determine = max(num_classes - 1, 0)
-        hd95_per_class = torch.full((determine,), float("nan"), dtype=torch.float32)
-        hd95_mean_excl_bg = float("nan")
+    hd95_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+    nsd_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+    if compute_hd95 and fg_classes > 0:
+        valid_hd = cnt_hd95 > 0
+        hd95_per_class[valid_hd] = (sum_hd95[valid_hd] / cnt_hd95[valid_hd]).float()
+    if compute_nsd and fg_classes > 0:
+        valid_nsd = cnt_nsd > 0
+        nsd_per_class[valid_nsd] = (sum_nsd[valid_nsd] / cnt_nsd[valid_nsd]).float()
+
+    hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
+    nsd_mean_excl_bg = float(torch.nanmean(nsd_per_class).item()) if nsd_per_class.numel() > 0 else float("nan")
 
     case_rows_sorted = sorted(case_rows, key=lambda r: r["dice_mean_fg"])
     dices = np.array([r["dice_mean_fg"] for r in case_rows_sorted], dtype=np.float32)
@@ -664,6 +758,8 @@ def run_test_single_model_and_print_cases(
         writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
         if compute_hd95:
             writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        if compute_nsd:
+            writer.add_scalar(f"{prefix}/nsd_mean_excl_bg", nsd_mean_excl_bg, global_step)
 
         for c in range(num_classes):
             writer.add_scalar(
@@ -679,14 +775,23 @@ def run_test_single_model_and_print_cases(
                     float(hd95_per_class[idx].item()),
                     global_step,
                 )
+        if compute_nsd:
+            for idx in range(nsd_per_class.numel()):
+                writer.add_scalar(
+                    f"{prefix}/per_class_nsd/{class_names[idx + 1]}",
+                    float(nsd_per_class[idx].item()),
+                    global_step,
+                )
 
     return {
         "ckpt_path": ckpt_path,
         "dice_mean_incl_bg": dice_mean_incl_bg,
         "dice_mean_fg": dice_mean_fg,
         "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "nsd_mean_excl_bg": nsd_mean_excl_bg,
         "dice_per_class_incl_bg": dice_per_class_mean_f32,
         "hd95_per_class_excl_bg": hd95_per_class,
+        "nsd_per_class_excl_bg": nsd_per_class,
         "case_rows": case_rows_sorted,
         "case_fg_dice_mean": mean_fg,
         "case_fg_dice_std": std_fg,
@@ -708,6 +813,7 @@ def save_test_results_csv(
 
     dice_pc = test_res["dice_per_class_incl_bg"]
     hd_pc = test_res["hd95_per_class_excl_bg"]
+    nsd_pc = test_res["nsd_per_class_excl_bg"]
     case_rows = test_res["case_rows"]
 
     with open(summary_csv, "w", newline="", encoding="utf-8") as f:
@@ -720,6 +826,7 @@ def save_test_results_csv(
                 "test_dice_mean_fg",
                 "test_dice_mean_incl_bg",
                 "test_hd95_mean_excl_bg",
+                "test_nsd_mean_excl_bg",
                 "case_fg_dice_mean",
                 "case_fg_dice_std",
                 "case_fg_dice_outlier_threshold",
@@ -734,6 +841,7 @@ def save_test_results_csv(
                 "test_dice_mean_fg": safe_float(test_res["dice_mean_fg"]),
                 "test_dice_mean_incl_bg": safe_float(test_res["dice_mean_incl_bg"]),
                 "test_hd95_mean_excl_bg": safe_float(test_res["hd95_mean_excl_bg"]),
+                "test_nsd_mean_excl_bg": safe_float(test_res["nsd_mean_excl_bg"]),
                 "case_fg_dice_mean": safe_float(test_res["case_fg_dice_mean"]),
                 "case_fg_dice_std": safe_float(test_res["case_fg_dice_std"]),
                 "case_fg_dice_outlier_threshold": safe_float(test_res["case_fg_dice_outlier_threshold"]),
@@ -743,28 +851,33 @@ def save_test_results_csv(
     with open(per_class_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["class_index", "class_name", "dice", "hd95"],
+            fieldnames=["class_index", "class_name", "dice", "hd95", "nsd"],
         )
         writer.writeheader()
         for c, class_name in enumerate(class_names):
             dice_val = float(dice_pc[c].item()) if not torch.isnan(dice_pc[c]) else None
             hd95_val = None
+            nsd_val = None
             if c > 0 and (c - 1) < hd_pc.numel():
                 hd_v = hd_pc[c - 1]
                 hd95_val = float(hd_v.item()) if not torch.isnan(hd_v) else None
+            if c > 0 and (c - 1) < nsd_pc.numel():
+                nsd_v = nsd_pc[c - 1]
+                nsd_val = float(nsd_v.item()) if not torch.isnan(nsd_v) else None
             writer.writerow(
                 {
                     "class_index": c,
                     "class_name": class_name,
                     "dice": dice_val,
                     "hd95": hd95_val,
+                    "nsd": nsd_val,
                 }
             )
 
     with open(case_ranking_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["rank_ascending_fg_dice", "case_id", "dice_mean_fg", "is_outlier"],
+            fieldnames=["rank_ascending_fg_dice", "case_id", "dice_mean_fg", "is_outlier", "hd95_per_class_excl_bg", "nsd_per_class_excl_bg"],
         )
         writer.writeheader()
         for row in case_rows:
@@ -774,6 +887,8 @@ def save_test_results_csv(
                     "case_id": row["case_id"],
                     "dice_mean_fg": safe_float(row["dice_mean_fg"]),
                     "is_outlier": bool(row["is_outlier"]),
+                    "hd95_per_class_excl_bg": json.dumps(row.get("hd95_per_class_excl_bg", []), ensure_ascii=False),
+                    "nsd_per_class_excl_bg": json.dumps(row.get("nsd_per_class_excl_bg", []), ensure_ascii=False),
                 }
             )
 
@@ -860,6 +975,7 @@ def main():
             "test_report_metrics": [
                 "test/dice_mean_fg (foreground only, single best.pt)",
                 "test/hd95_mean_excl_bg (foreground only, single best.pt)",
+                "test/nsd_mean_excl_bg (foreground only, single best.pt)",
             ],
             "sw_infer_mode": "gaussian",
             "code_snapshot_dir": os.path.join(output_dir, "snapshot"),
@@ -1145,6 +1261,9 @@ def main():
                     writer=writer,
                     prefix="val",
                     compute_hd95=False,
+                    compute_nsd=False,
+                    pixdim=pixdim,
+                    nsd_tol_mm=args.nsd_tol_mm,
                 )
                 model.train()
                 dice_fg = float(val_res["dice_mean_fg"])
@@ -1224,12 +1343,17 @@ def main():
             writer=writer,
             prefix="test",
             compute_hd95=True,
+            compute_nsd=True,
+            pixdim=pixdim,
+            nsd_tol_mm=args.nsd_tol_mm,
         )
 
         test_dice_fg = float(test_res["dice_mean_fg"])
         test_hd95 = float(test_res["hd95_mean_excl_bg"])
+        test_nsd = float(test_res["nsd_mean_excl_bg"])
         dice_pc = test_res["dice_per_class_incl_bg"]
         hd_pc = test_res["hd95_per_class_excl_bg"]
+        nsd_pc = test_res["nsd_per_class_excl_bg"]
 
         print("\n================ TEST (single best.pt) ================")
         print(f"best_iter                 : {best_step}")
@@ -1237,6 +1361,7 @@ def main():
         print(f"best_path                 : {best_path}")
         print(f"TEST dice_mean_fg         : {test_dice_fg:.6f}")
         print(f"TEST hd95_mean_excl_bg    : {test_hd95:.6f}")
+        print(f"TEST nsd_mean_excl_bg     : {test_nsd:.6f}")
         print("=======================================================\n")
 
         print("Per-class Dice (incl bg, mean-over-cases):")
@@ -1249,6 +1374,13 @@ def main():
             idx = c - 1
             if idx < hd_pc.numel():
                 v = float(hd_pc[idx].item())
+                print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
+
+        print("\nPer-class NSD (excl bg):")
+        for c in range(1, num_classes):
+            idx = c - 1
+            if idx < nsd_pc.numel():
+                v = float(nsd_pc[idx].item())
                 print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
 
         test_csv_paths = save_test_results_csv(

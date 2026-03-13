@@ -1,0 +1,1926 @@
+import os
+import re
+import json
+import time
+import math
+import argparse
+import tempfile
+import random
+import shutil
+import sys
+import platform
+import hashlib
+import inspect
+import subprocess
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
+from tqdm import tqdm
+
+from monai.config import print_config
+from monai.utils import set_determinism
+from monai.data import (
+    DataLoader,
+    CacheDataset,
+    load_decathlon_datalist,
+    decollate_batch,
+    list_data_collate,
+)
+from monai.inferers import sliding_window_inference
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric, HausdorffDistanceMetric, SurfaceDistanceMetric, SurfaceDiceMetric
+from monai.transforms import (
+    AsDiscrete,
+    Compose,
+    CropForegroundd,
+    EnsureChannelFirstd,
+    LoadImaged,
+    Orientationd,
+    RandCropByPosNegLabeld,
+    ScaleIntensityRanged,
+    Spacingd,
+    RandScaleIntensityd,
+    RandGaussianNoised,
+    RandAffined,
+    RandShiftIntensityd,
+)
+import numpy as np
+from networks.model import VNet
+from networks.UNet3D import UNet3D
+from networks.basic import VNet
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
+
+
+CLASS_LABELS = {
+    "0": "background",
+    "1": "spleen",
+    "2": "rkid",
+    "3": "lkid",
+    "4": "gall",
+    "5": "eso",
+    "6": "liver",
+    "7": "sto",
+    "8": "aorta",
+    "9": "IVC",
+    "10": "veins",
+    "11": "pancreas",
+    "12": "rad",
+    "13": "lad",
+}
+rot = np.deg2rad(30.0)
+
+DEFAULT_NSD_TOL_MM = 1.0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        "BTCV -- basic"
+    )
+    parser.add_argument("--data_dir", type=str, default="../data/btcv")
+    parser.add_argument("--split_json", type=str, default="dataset_0.json")
+    parser.add_argument("--output_root", type=str, default="./outputs_basic")
+    parser.add_argument("--run_name", type=str, default="", help="optional, if empty use timestamp")
+    parser.add_argument("--pixdim", type=float, nargs=3, default=[1.5, 1.5, 2.0])
+    parser.add_argument("--roi_size", type=int, nargs=3, default=[96, 96, 96])
+    parser.add_argument("--num_classes", type=int, default=14)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_samples", type=int, default=2, help="RandCropByPosNegLabeld num_samples")
+    parser.add_argument("--cache_num_train", type=int, default=18, help="<=0 means cache all")
+    parser.add_argument("--cache_num_val", type=int, default=12, help="<=0 means cache all")
+    parser.add_argument("--cache_num_test", type=int, default=12, help="<=0 means cache all")
+    parser.add_argument("--cache_rate", type=float, default=1.0)
+    parser.add_argument("--num_workers_train", type=int, default=8)
+    parser.add_argument("--num_workers_val", type=int, default=6)
+    parser.add_argument("--num_workers_test", type=int, default=6)
+    parser.add_argument("--max_iterations", type=int, default=34400)
+    parser.add_argument("--eval_num", type=int, default=400)
+    parser.add_argument("--val_start_iter", type=int, default=8800, help="start val eval at this iter (inclusive)")
+    parser.add_argument("--sw_batch_size", type=int, default=2)
+    parser.add_argument("--sw_overlap", type=float, default=0.5)
+    parser.add_argument("--topk", type=int, default=3, help="keep top-k checkpoints by val foreground Dice")
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--wd", type=float, default=1e-4)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--use_poly", action="store_true", help="use PolyLR per-iteration")
+    parser.add_argument("--poly_power", type=float, default=0.9)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=11,
+        help="stop after N validations without improvement (monitor: val foreground Dice)",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=1e-3,
+        help="minimum absolute improvement to reset patience",
+    )
+    parser.add_argument(
+        "--early_stop_warmup",
+        type=int,
+        default=0,
+        help="ignore early-stop counting for first N validations",
+    )
+    parser.add_argument(
+        "--pool_keys",
+        type=str,
+        nargs="+",
+        default=["training", "validation"],
+        help="take labeled cases from these json keys and merge as pool (must contain image+label pairs)",
+    )
+    parser.add_argument("--train_num", type=int, default=18, help="number of train cases (default 18)")
+    parser.add_argument(
+        "--val_num",
+        type=int,
+        default=12,
+        help="number of validation cases (ONLY used when --val_separate is set). Default 12.",
+    )
+    parser.add_argument("--test_num", type=int, default=12, help="number of test cases (default 12)")
+    parser.add_argument(
+        "--val_separate",
+        action="store_true",
+        help="if set, split into independent val and test sets using val_num/test_num. "
+        "If not set (default), val set will be identical to test set.",
+    )
+    parser.add_argument("--split_seed", type=int, default=123, help="seed for deterministic split shuffling")
+    parser.add_argument(
+        "--exclude_cases",
+        type=str,
+        nargs="*",
+        default=[],
+        help="exclude these case ids before splitting (e.g. 0008). default: [] (no exclusion)",
+    )
+    parser.add_argument(
+        "--snapshot_extra",
+        type=str,
+        nargs="*",
+        default=["networks"],
+        help="extra relative paths (dirs/files) to snapshot into outputs (e.g. networks configs).",
+    )
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--multi_run", action="store_true", default=True, help="run 5 sequential experiments with different fixed seeds")
+    parser.add_argument("--single_run", action="store_true", help="internal flag: run only one experiment")
+    parser.add_argument("--multi_run_count", type=int, default=5, help="number of sequential runs in multi-run mode")
+    parser.add_argument("--multi_run_seed_start", type=int, default=123, help="first fixed seed for multi-run mode")
+    parser.add_argument("--multi_run_seed_step", type=int, default=100, help="fixed seed step for multi-run mode")
+    parser.add_argument("--amp", action="store_true", help="use mixed precision")
+    parser.add_argument("--cudnn_benchmark", action="store_true", help="torch.backends.cudnn.benchmark=True")
+    parser.add_argument("--cv_num_folds", type=int, default=5, help="number of folds for cross validation")
+    parser.add_argument(
+        "--cv_fold_index",
+        type=int,
+        default=-1,
+        help="internal flag: 0-based fold index for a single-fold run; <0 means batch driver mode",
+    )
+    return parser.parse_args()
+
+
+def seed_everything(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    set_determinism(seed=seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def safe_float(x: float) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        return None
+    return float(x)
+
+
+def tensor_to_float_list(t: torch.Tensor) -> List[Optional[float]]:
+    t = t.detach().float().cpu()
+    out: List[Optional[float]] = []
+    for v in t.tolist():
+        out.append(safe_float(v))
+    return out
+
+
+def get_class_names(num_classes: int) -> List[str]:
+    names = []
+    for i in range(num_classes):
+        key = str(i)
+        names.append(CLASS_LABELS.get(key, f"class_{i}"))
+    return names
+
+
+def _safe_run_cmd(cmd: List[str], cwd: Optional[str] = None, timeout: int = 5) -> Tuple[int, str, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+        return int(p.returncode), p.stdout.strip(), p.stderr.strip()
+    except Exception as e:
+        return 999, "", f"{type(e).__name__}: {e}"
+
+
+def _sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _ignore_snapshot_files(dirpath: str, names: List[str]) -> set:
+    ignore = {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".git",
+        ".idea",
+        ".vscode",
+        "wandb",
+        ".DS_Store",
+    }
+    out = set()
+    for n in names:
+        if n in ignore:
+            out.add(n)
+        elif n.endswith((".pyc", ".pyo", ".so")):
+            out.add(n)
+    return out
+
+
+def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = None) -> None:
+    snapshot_dir = os.path.join(output_dir, "snapshot")
+    os.makedirs(snapshot_dir, exist_ok=True)
+
+    script_path = None
+    try:
+        script_path = os.path.abspath(__file__)
+    except Exception:
+        script_path = None
+
+    if script_path and os.path.isfile(script_path):
+        base_dir = os.path.dirname(script_path)
+    else:
+        base_dir = os.getcwd()
+
+    copied: List[Dict[str, Any]] = []
+
+    if script_path and os.path.isfile(script_path):
+        dst = os.path.join(snapshot_dir, os.path.basename(script_path))
+        shutil.copy2(script_path, dst)
+        copied.append({"type": "file", "src": script_path, "dst": dst, "sha256": _sha256_file(dst)})
+    else:
+        try:
+            src_text = inspect.getsource(sys.modules[__name__])
+            dst = os.path.join(snapshot_dir, "train_script_snapshot.py")
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write(src_text)
+            copied.append(
+                {"type": "file_generated", "src": "<inspect.getsource>", "dst": dst, "sha256": _sha256_file(dst)}
+            )
+        except Exception as e:
+            print(f"[SNAPSHOT][WARN] cannot save script source: {type(e).__name__}: {e}")
+
+    extra_rel_paths = extra_rel_paths or []
+    for rel in extra_rel_paths:
+        if not rel:
+            continue
+        src = rel
+        if not os.path.isabs(src):
+            src = os.path.join(base_dir, rel)
+        if not os.path.exists(src):
+            print(f"[SNAPSHOT][WARN] extra path not found: {src}")
+            continue
+
+        dst = os.path.join(snapshot_dir, os.path.basename(src))
+        try:
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst, ignore=_ignore_snapshot_files)
+                copied.append({"type": "dir", "src": src, "dst": dst})
+            else:
+                shutil.copy2(src, dst)
+                copied.append({"type": "file", "src": src, "dst": dst, "sha256": _sha256_file(dst)})
+        except Exception as e:
+            print(f"[SNAPSHOT][WARN] failed copying {src} -> {dst}: {type(e).__name__}: {e}")
+
+    git_commit = ""
+    git_dirty = None
+    git_root = None
+    if base_dir:
+        rc, out, _ = _safe_run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=base_dir)
+        if rc == 0 and out:
+            git_root = out
+            rc2, out2, _ = _safe_run_cmd(["git", "rev-parse", "HEAD"], cwd=git_root)
+            if rc2 == 0:
+                git_commit = out2.strip()
+            rc3, out3, _ = _safe_run_cmd(["git", "status", "--porcelain"], cwd=git_root)
+            if rc3 == 0:
+                git_dirty = len(out3.strip()) > 0
+
+    meta = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": os.path.abspath(output_dir),
+        "snapshot_dir": os.path.abspath(snapshot_dir),
+        "script_path": os.path.abspath(script_path) if script_path else "",
+        "base_dir": os.path.abspath(base_dir) if base_dir else "",
+        "cmdline": sys.argv,
+        "python": {"version": sys.version.replace("\n", " "), "executable": sys.executable},
+        "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
+        "packages": {
+            "torch": getattr(torch, "__version__", ""),
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": getattr(torch.version, "cuda", ""),
+            "cudnn_version": torch.backends.cudnn.version() if hasattr(torch.backends, "cudnn") else None,
+            "monai": "",
+        },
+        "git": {"root": git_root or "", "commit": git_commit, "dirty": git_dirty},
+        "copied": copied,
+    }
+
+    try:
+        import monai
+
+        meta["packages"]["monai"] = getattr(monai, "__version__", "")
+    except Exception:
+        meta["packages"]["monai"] = ""
+
+    with open(os.path.join(snapshot_dir, "snapshot_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[SNAPSHOT] saved to: {snapshot_dir}")
+    print(f"[SNAPSHOT] items: {len(copied)} (meta written: snapshot_meta.json)")
+
+
+def _normalize_case_id(cid: str) -> str:
+    cid = str(cid).strip()
+    if cid.isdigit():
+        return cid.zfill(4)
+    return cid
+
+
+def _extract_case_ids_from_basename(base: str) -> List[str]:
+    ids: List[str] = []
+    ids4 = re.findall(r"(?<!\d)(\d{4})(?!\d)", base)
+    if ids4:
+        return [x for x in ids4]
+    for g in re.findall(r"\d+", base):
+        if len(g) <= 4:
+            ids.append(g.zfill(4))
+    return ids
+
+
+def _match_excluded_case(d: Dict[str, Any], excluded_set: set) -> bool:
+    for k in ("image", "label"):
+        p = str(d.get(k, "") or "")
+        base = os.path.basename(p)
+        cand = _extract_case_ids_from_basename(base)
+        if any(c in excluded_set for c in cand):
+            return True
+    return False
+
+
+def build_custom_splits_from_json(
+    json_path: str,
+    pool_keys: List[str],
+    train_num: int,
+    val_num: int,
+    test_num: int,
+    split_seed: int,
+    exclude_cases: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    pool: List[Dict[str, Any]] = []
+    for k in pool_keys:
+        part = load_decathlon_datalist(json_path, True, k)
+        pool.extend(part)
+
+    uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for d in pool:
+        key = (d.get("image", ""), d.get("label", ""))
+        if not key[0] or not key[1]:
+            continue
+        uniq[key] = d
+    pool = list(uniq.values())
+
+    excluded_set = set()
+    if exclude_cases:
+        excluded_set = {_normalize_case_id(x) for x in exclude_cases}
+
+    if excluded_set:
+        before = len(pool)
+        pool = [d for d in pool if not _match_excluded_case(d, excluded_set)]
+        after = len(pool)
+        print(f"[SPLIT] excluded cases={sorted(list(excluded_set))} | removed={before-after} | remain={after}")
+
+    rng = random.Random(int(split_seed))
+    rng.shuffle(pool)
+
+    total = len(pool)
+    val_num = max(0, int(val_num))
+    test_num = max(0, int(test_num))
+    train_num = int(train_num)
+
+    if val_num + test_num > total:
+        overflow = val_num + test_num - total
+        test_num = max(0, test_num - overflow)
+
+    remain = total - (val_num + test_num)
+    if train_num < 0:
+        train_num = remain
+    else:
+        train_num = min(train_num, remain)
+
+    val_files = pool[:val_num]
+    test_files = pool[val_num: val_num + test_num]
+    train_files = pool[val_num + test_num: val_num + test_num + train_num]
+    return train_files, val_files, test_files
+
+
+def build_kfold_splits_from_json(
+    json_path: str,
+    pool_keys: List[str],
+    n_splits: int,
+    split_seed: int,
+    exclude_cases: Optional[List[str]] = None,
+) -> List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    pool: List[Dict[str, Any]] = []
+    for k in pool_keys:
+        part = load_decathlon_datalist(json_path, True, k)
+        pool.extend(part)
+
+    uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for d in pool:
+        key = (d.get("image", ""), d.get("label", ""))
+        if not key[0] or not key[1]:
+            continue
+        uniq[key] = d
+    pool = list(uniq.values())
+    excluded_set = set()
+    if exclude_cases:
+        excluded_set = {_normalize_case_id(x) for x in exclude_cases}
+
+    if excluded_set:
+        before = len(pool)
+        pool = [d for d in pool if not _match_excluded_case(d, excluded_set)]
+        after = len(pool)
+        print(f"[CV] excluded cases={sorted(list(excluded_set))} | removed={before-after} | remain={after}")
+
+    if int(n_splits) != 5:
+        raise ValueError(f"This script is configured for 5-fold CV only, got n_splits={n_splits}")
+
+    total = len(pool)
+    if total != 30:
+        raise ValueError(
+            f"5-fold CV with 24 train / 6 val requires exactly 30 labeled cases after exclusion, got total={total}. "
+            f"Please check pool_keys / exclude_cases."
+        )
+
+    rng = random.Random(int(split_seed))
+    rng.shuffle(pool)
+
+    fold_size = total // n_splits
+    folds: List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = []
+    for fold_idx in range(n_splits):
+        s = fold_idx * fold_size
+        e = s + fold_size
+        val_files = pool[s:e]
+        train_files = pool[:s] + pool[e:]
+        if len(train_files) != 24 or len(val_files) != 6:
+            raise RuntimeError(
+                f"Unexpected fold size at fold={fold_idx}: train={len(train_files)}, val={len(val_files)}"
+            )
+        folds.append((train_files, val_files))
+    return folds
+
+
+def _strip_known_ext(name: str) -> str:
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    return os.path.splitext(name)[0]
+
+
+def _get_case_id(batch: Dict[str, Any]) -> str:
+    fn = batch["image"].meta["filename_or_obj"]
+    if isinstance(fn, (list, tuple)):
+        fn = fn[0]
+    base = os.path.basename(str(fn))
+    cand = _extract_case_ids_from_basename(base)
+    if len(cand) > 0:
+        return cand[0]
+    return _strip_known_ext(base)
+
+
+def dice_per_class_onehot(
+    y_pred_1hot: torch.Tensor,
+    y_true_1hot: torch.Tensor,
+    eps: float = 1e-8,
+    ignore_empty: bool = True,
+) -> torch.Tensor:
+    if y_pred_1hot.dim() == 5:
+        y_pred_1hot = y_pred_1hot[0]
+    if y_true_1hot.dim() == 5:
+        y_true_1hot = y_true_1hot[0]
+
+    y_pred = y_pred_1hot.float()
+    y_true = y_true_1hot.float()
+
+    dims = tuple(range(1, y_pred.dim()))
+    inter = (y_pred * y_true).sum(dim=dims)
+    pred_sum = y_pred.sum(dim=dims)
+    true_sum = y_true.sum(dim=dims)
+    denom = pred_sum + true_sum
+
+    dice = (2.0 * inter) / (denom + eps)
+
+    if ignore_empty:
+        nan = torch.tensor(float("nan"), device=dice.device, dtype=dice.dtype)
+        dice = torch.where(true_sum > 0, dice, nan)
+    else:
+        dice = torch.where(denom > 0, dice, torch.ones_like(dice))
+    return dice
+
+
+def _excel_autofit(ws):
+    for col_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for c in col_cells:
+            v = c.value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
+
+
+def save_test_metrics_excel(
+    xlsx_path: str,
+    summary: Dict[str, Any],
+    per_class_rows: List[Dict[str, Any]],
+    per_case_rows: List[Dict[str, Any]],
+    per_case_per_class_rows: List[Dict[str, Any]],
+) -> None:
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "summary"
+    ws.append(["key", "value"])
+    for k, v in summary.items():
+        if isinstance(v, (list, tuple, dict, set)):
+            continue
+        ws.append([k, v])
+    ws.freeze_panes = "A2"
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws)
+
+    ws2 = wb.create_sheet("per_class")
+    headers = ["class_index", "class_name", "dice_mean", "hd95_mean", "assd_mean", "nsd_mean"]
+    ws2.append(headers)
+    for r in per_class_rows:
+        ws2.append([r.get(h) for h in headers])
+    ws2.freeze_panes = "A2"
+    for cell in ws2[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws2)
+
+    ws3 = wb.create_sheet("per_case")
+    headers3 = ["case_id", "dice_mean_fg", "hd95_mean_excl_bg", "assd_mean_excl_bg", "nsd_mean_excl_bg"]
+    ws3.append(headers3)
+    for r in per_case_rows:
+        ws3.append([r.get(h) for h in headers3])
+    ws3.freeze_panes = "A2"
+    for cell in ws3[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws3)
+
+    ws4 = wb.create_sheet("per_case_per_class")
+    headers4 = ["case_id", "class_index", "class_name", "dice", "hd95", "assd", "nsd"]
+    ws4.append(headers4)
+    for r in per_case_per_class_rows:
+        ws4.append([r.get(h) for h in headers4])
+    ws4.freeze_panes = "A2"
+    for cell in ws4[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws4)
+
+    wb.save(xlsx_path)
+
+
+@torch.no_grad()
+def run_evaluation_single_model(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    roi_size: Tuple[int, int, int],
+    sw_batch_size: int,
+    sw_overlap: float,
+    num_classes: int,
+    class_names: List[str],
+    post_label: AsDiscrete,
+    post_pred: AsDiscrete,
+    global_step: int,
+    writer: Optional[SummaryWriter] = None,
+    prefix: str = "val",
+    compute_hd95: bool = False,
+) -> Dict[str, Any]:
+    model.eval()
+
+    dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=True)
+
+    hd95_metric = None
+    if compute_hd95:
+        hd95_metric = HausdorffDistanceMetric(
+            include_background=False,
+            reduction="mean_batch",
+            percentile=95,
+            get_not_nans=True,
+        )
+
+    pbar = tqdm(loader, desc=f"{prefix.upper()}@{global_step}", dynamic_ncols=True)
+    for batch in pbar:
+        inputs = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        outputs = sliding_window_inference(
+            inputs,
+            roi_size=roi_size,
+            sw_batch_size=sw_batch_size,
+            predictor=model,
+            overlap=sw_overlap,
+            mode="gaussian",
+        )
+
+        labels_list = decollate_batch(labels)
+        labels_convert = [post_label(x) for x in labels_list]
+
+        outputs_list = decollate_batch(outputs)
+        outputs_convert = [post_pred(x) for x in outputs_list]
+
+        dice_metric(y_pred=outputs_convert, y=labels_convert)
+        if hd95_metric is not None:
+            hd95_metric(y_pred=outputs_convert, y=labels_convert)
+
+    dice_agg = dice_metric.aggregate()
+    dice_metric.reset()
+
+    dice_per_class = dice_agg[0] if isinstance(dice_agg, (tuple, list)) else dice_agg
+    dice_per_class = dice_per_class.detach().float().cpu()
+
+    if hd95_metric is not None:
+        hd_agg = hd95_metric.aggregate()
+        hd95_metric.reset()
+        hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
+        hd95_per_class = hd95_per_class.detach().float().cpu()
+    else:
+        hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float32)
+
+    dice_mean_incl_bg = float(torch.nanmean(dice_per_class).item())
+    dice_mean_fg = float(torch.nanmean(dice_per_class[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
+    hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
+
+    if writer is not None:
+        writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
+        if compute_hd95:
+            writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+
+        for c in range(num_classes):
+            writer.add_scalar(
+                f"{prefix}/per_class_dice/{class_names[c]}",
+                float(dice_per_class[c].item()),
+                global_step,
+            )
+        if compute_hd95:
+            for idx in range(hd95_per_class.numel()):
+                writer.add_scalar(
+                    f"{prefix}/per_class_hd95/{class_names[idx + 1]}",
+                    float(hd95_per_class[idx].item()),
+                    global_step,
+                )
+
+    return {
+        "dice_mean_incl_bg": dice_mean_incl_bg,
+        "dice_mean_fg": dice_mean_fg,
+        "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "dice_per_class_incl_bg": dice_per_class,
+        "hd95_per_class_excl_bg": hd95_per_class,
+    }
+
+
+@torch.no_grad()
+def run_test_best_and_export_excel(
+    model: torch.nn.Module,
+    best_ckpt_path: str,
+    loader: DataLoader,
+    device: torch.device,
+    roi_size: Tuple[int, int, int],
+    sw_batch_size: int,
+    sw_overlap: float,
+    num_classes: int,
+    class_names: List[str],
+    post_label: AsDiscrete,
+    post_pred: AsDiscrete,
+    global_step: int,
+    output_dir: str,
+    pixdim: Tuple[float, float, float],
+    writer: Optional[SummaryWriter] = None,
+    prefix: str = "test",
+    compute_hd95: bool = True,
+    compute_assd: bool = True,
+    compute_nsd: bool = True,
+    nsd_tol_mm: float = DEFAULT_NSD_TOL_MM,
+    xlsx_filename: str = "test_metrics.xlsx",
+    report_title: str = "TEST",
+) -> Dict[str, Any]:
+    assert os.path.isfile(best_ckpt_path), f"best_ckpt_path not found: {best_ckpt_path}"
+
+    def _to_case_chwd(x: torch.Tensor, n_cls: int) -> torch.Tensor:
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor, got {type(x)}")
+
+        if x.ndim == 4:
+            return x
+
+        if x.ndim == 5:
+            if x.shape[0] == 1 and x.shape[1] == n_cls:
+                return x.squeeze(0)
+            if x.shape[0] == n_cls and x.shape[1] == 1:
+                return x.squeeze(1)
+
+        raise ValueError(f"Expected one-case tensor in CHWD-like shape, got shape={tuple(x.shape)}")
+
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=device), strict=True)
+    model.eval()
+
+    sum_dice = torch.zeros((num_classes,), dtype=torch.float64)
+    cnt_dice = torch.zeros((num_classes,), dtype=torch.float64)
+
+    fg_classes = max(num_classes - 1, 0)
+    sum_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+
+    sum_assd = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_assd = torch.zeros((fg_classes,), dtype=torch.float64)
+
+    sum_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
+
+    case_rows: List[Dict[str, Any]] = []
+    per_case_per_class_rows: List[Dict[str, Any]] = []
+
+    pbar = tqdm(loader, desc=f"{prefix.upper()}(best)@{global_step}", dynamic_ncols=True)
+    for batch in pbar:
+        case_id = _get_case_id(batch)
+        inputs = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        logits = sliding_window_inference(
+            inputs,
+            roi_size=roi_size,
+            sw_batch_size=sw_batch_size,
+            predictor=model,
+            overlap=sw_overlap,
+            mode="gaussian",
+        )
+
+        labels_list = decollate_batch(labels)
+        labels_1hot_list = [post_label(x) for x in labels_list]
+
+        logits_list = decollate_batch(logits)
+        preds_1hot_list = [post_pred(x) for x in logits_list]
+
+        pred_case = _to_case_chwd(preds_1hot_list[0], num_classes)
+        true_case = _to_case_chwd(labels_1hot_list[0], num_classes)
+
+        if pred_case.shape != true_case.shape:
+            raise ValueError(
+                f"Prediction/label shape mismatch for case={case_id}: "
+                f"pred={tuple(pred_case.shape)} vs true={tuple(true_case.shape)}"
+            )
+
+        if pred_case.ndim != 4:
+            raise ValueError(
+                f"Expected CHWD tensor for metrics, got pred shape={tuple(pred_case.shape)} "
+                f"for case={case_id}"
+            )
+
+        dice_c = dice_per_class_onehot(pred_case, true_case, ignore_empty=True)
+        dice_fg = float(torch.nanmean(dice_c[1:]).item()) if num_classes > 1 else float(torch.nanmean(dice_c).item())
+
+        dice_c_cpu = dice_c.detach().cpu().double()
+        dice_valid = ~torch.isnan(dice_c_cpu)
+        sum_dice += torch.nan_to_num(dice_c_cpu, nan=0.0)
+        cnt_dice += dice_valid.double()
+
+        if fg_classes > 0:
+            if compute_hd95:
+                tmp_hd95 = HausdorffDistanceMetric(
+                    include_background=False,
+                    reduction="none",
+                    percentile=95,
+                    get_not_nans=False,
+                )
+                tmp_hd95(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+                hd95_case = tmp_hd95.aggregate()
+                tmp_hd95.reset()
+                if isinstance(hd95_case, (tuple, list)):
+                    hd95_case = hd95_case[0]
+                hd95_case = hd95_case.squeeze(0).detach().cpu().float()
+            else:
+                hd95_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+
+            if compute_assd:
+                tmp_assd = SurfaceDistanceMetric(
+                    include_background=False,
+                    symmetric=True,
+                    reduction="none",
+                    get_not_nans=False,
+                )
+                tmp_assd(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+                assd_case = tmp_assd.aggregate()
+                tmp_assd.reset()
+                if isinstance(assd_case, (tuple, list)):
+                    assd_case = assd_case[0]
+                assd_case = assd_case.squeeze(0).detach().cpu().float()
+            else:
+                assd_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+
+            if compute_nsd:
+                nsd_thresholds = [float(nsd_tol_mm)] * fg_classes
+                tmp_nsd = SurfaceDiceMetric(
+                    class_thresholds=nsd_thresholds,
+                    include_background=False,
+                    reduction="none",
+                    get_not_nans=False,
+                    use_subvoxels=True,
+                )
+                tmp_nsd(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+                nsd_case = tmp_nsd.aggregate()
+                tmp_nsd.reset()
+                if isinstance(nsd_case, (tuple, list)):
+                    nsd_case = nsd_case[0]
+                nsd_case = nsd_case.squeeze(0).detach().cpu().float()
+            else:
+                nsd_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+
+            if hd95_case.numel() != fg_classes:
+                raise ValueError(
+                    f"HD95 result numel mismatch for case={case_id}: "
+                    f"expected {fg_classes}, got {hd95_case.numel()}"
+                )
+            if assd_case.numel() != fg_classes:
+                raise ValueError(
+                    f"ASSD result numel mismatch for case={case_id}: "
+                    f"expected {fg_classes}, got {assd_case.numel()}"
+                )
+            if nsd_case.numel() != fg_classes:
+                raise ValueError(
+                    f"NSD result numel mismatch for case={case_id}: "
+                    f"expected {fg_classes}, got {nsd_case.numel()}"
+                )
+
+            hd95_cpu = hd95_case.double()
+            hd95_valid = ~torch.isnan(hd95_cpu)
+            sum_hd95 += torch.nan_to_num(hd95_cpu, nan=0.0)
+            cnt_hd95 += hd95_valid.double()
+
+            assd_cpu = assd_case.double()
+            assd_valid = ~torch.isnan(assd_cpu)
+            sum_assd += torch.nan_to_num(assd_cpu, nan=0.0)
+            cnt_assd += assd_valid.double()
+
+            nsd_cpu = nsd_case.double()
+            nsd_valid = ~torch.isnan(nsd_cpu)
+            sum_nsd += torch.nan_to_num(nsd_cpu, nan=0.0)
+            cnt_nsd += nsd_valid.double()
+
+            hd95_fg = float(torch.nanmean(hd95_case).item()) if hd95_case.numel() > 0 else float("nan")
+            assd_fg = float(torch.nanmean(assd_case).item()) if assd_case.numel() > 0 else float("nan")
+            nsd_fg = float(torch.nanmean(nsd_case).item()) if nsd_case.numel() > 0 else float("nan")
+        else:
+            hd95_case = torch.empty((0,), dtype=torch.float32)
+            assd_case = torch.empty((0,), dtype=torch.float32)
+            nsd_case = torch.empty((0,), dtype=torch.float32)
+            hd95_fg = float("nan")
+            assd_fg = float("nan")
+            nsd_fg = float("nan")
+
+        case_rows.append(
+            {
+                "case_id": case_id,
+                "dice_mean_fg": dice_fg,
+                "hd95_mean_excl_bg": hd95_fg,
+                "assd_mean_excl_bg": assd_fg,
+                "nsd_mean_excl_bg": nsd_fg,
+                "dice_per_class_incl_bg": tensor_to_float_list(dice_c.detach().cpu().float()),
+                "hd95_per_class_excl_bg": tensor_to_float_list(hd95_case),
+                "assd_per_class_excl_bg": tensor_to_float_list(assd_case),
+                "nsd_per_class_excl_bg": tensor_to_float_list(nsd_case),
+            }
+        )
+
+        for c in range(num_classes):
+            row = {
+                "case_id": case_id,
+                "class_index": c,
+                "class_name": class_names[c],
+                "dice": safe_float(float(dice_c[c].item())) if not torch.isnan(dice_c[c]) else None,
+                "hd95": None,
+                "assd": None,
+                "nsd": None,
+            }
+            if c >= 1:
+                idx = c - 1
+                if idx < hd95_case.numel():
+                    row["hd95"] = safe_float(float(hd95_case[idx].item())) if not torch.isnan(hd95_case[idx]) else None
+                if idx < assd_case.numel():
+                    row["assd"] = safe_float(float(assd_case[idx].item())) if not torch.isnan(assd_case[idx]) else None
+                if idx < nsd_case.numel():
+                    row["nsd"] = safe_float(float(nsd_case[idx].item())) if not torch.isnan(nsd_case[idx]) else None
+            per_case_per_class_rows.append(row)
+
+        pbar.set_postfix(
+            {
+                "case_fg_dice": f"{dice_fg:.4f}",
+                "case_fg_nsd": f"{nsd_fg:.4f}" if not math.isnan(nsd_fg) else "nan",
+            }
+        )
+
+    dice_per_class_mean = torch.full((num_classes,), float("nan"), dtype=torch.float64)
+    valid = cnt_dice > 0
+    dice_per_class_mean[valid] = sum_dice[valid] / cnt_dice[valid]
+    dice_per_class_mean_f32 = dice_per_class_mean.float()
+
+    if fg_classes > 0:
+        hd95_per_class_mean = torch.full((fg_classes,), float("nan"), dtype=torch.float64)
+        valid = cnt_hd95 > 0
+        hd95_per_class_mean[valid] = sum_hd95[valid] / cnt_hd95[valid]
+        hd95_per_class_mean_f32 = hd95_per_class_mean.float()
+
+        assd_per_class_mean = torch.full((fg_classes,), float("nan"), dtype=torch.float64)
+        valid = cnt_assd > 0
+        assd_per_class_mean[valid] = sum_assd[valid] / cnt_assd[valid]
+        assd_per_class_mean_f32 = assd_per_class_mean.float()
+
+        nsd_per_class_mean = torch.full((fg_classes,), float("nan"), dtype=torch.float64)
+        valid = cnt_nsd > 0
+        nsd_per_class_mean[valid] = sum_nsd[valid] / cnt_nsd[valid]
+        nsd_per_class_mean_f32 = nsd_per_class_mean.float()
+    else:
+        hd95_per_class_mean_f32 = torch.empty((0,), dtype=torch.float32)
+        assd_per_class_mean_f32 = torch.empty((0,), dtype=torch.float32)
+        nsd_per_class_mean_f32 = torch.empty((0,), dtype=torch.float32)
+
+    dice_mean_incl_bg = float(torch.nanmean(dice_per_class_mean_f32).item())
+    dice_mean_fg = float(torch.nanmean(dice_per_class_mean_f32[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
+    hd95_mean_excl_bg = (
+        float(torch.nanmean(hd95_per_class_mean_f32).item()) if hd95_per_class_mean_f32.numel() > 0 else float("nan")
+    )
+    assd_mean_excl_bg = (
+        float(torch.nanmean(assd_per_class_mean_f32).item()) if assd_per_class_mean_f32.numel() > 0 else float("nan")
+    )
+    nsd_mean_excl_bg = (
+        float(torch.nanmean(nsd_per_class_mean_f32).item()) if nsd_per_class_mean_f32.numel() > 0 else float("nan")
+    )
+
+    case_rows_sorted = sorted(
+        case_rows,
+        key=lambda r: (r["dice_mean_fg"] if r["dice_mean_fg"] is not None else float("inf"))
+    )
+    dices = np.array([r["dice_mean_fg"] for r in case_rows_sorted], dtype=np.float32)
+    mean_fg = float(np.mean(dices)) if dices.size > 0 else float("nan")
+    std_fg = float(np.std(dices)) if dices.size > 0 else float("nan")
+    thresh = mean_fg - 2.0 * std_fg if (not math.isnan(mean_fg) and not math.isnan(std_fg)) else float("-inf")
+
+    print(f"\n================ {report_title} CASES (sorted by fg Dice) ================")
+    print(f"Checkpoint: {best_ckpt_path}")
+    print(f"Case fgDice mean={mean_fg:.6f} std={std_fg:.6f} | outlier<thr={thresh:.6f}\n")
+    for i, r in enumerate(case_rows_sorted):
+        flag = "  <-- OUTLIER" if r["dice_mean_fg"] < thresh else ""
+        print(f"[{i:02d}] fgDice={r['dice_mean_fg']:.6f} | {r['case_id']}{flag}")
+    print("===============================================================\n")
+
+    print(f"\n================ {report_title} (best.pt) ================")
+    print(f"{report_title} dice_mean_fg         : {dice_mean_fg:.6f}")
+    print(f"{report_title} hd95_mean_excl_bg    : {hd95_mean_excl_bg:.6f}")
+    print(f"{report_title} assd_mean_excl_bg    : {assd_mean_excl_bg:.6f}")
+    print(f"{report_title} nsd_mean_excl_bg     : {nsd_mean_excl_bg:.6f} (tol={nsd_tol_mm} mm)")
+    print("================================================\n")
+
+    print("Per-class Dice (incl bg, mean-over-cases):")
+    for c in range(num_classes):
+        v = float(dice_per_class_mean_f32[c].item()) if not torch.isnan(dice_per_class_mean_f32[c]) else float("nan")
+        print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
+
+    if fg_classes > 0:
+        print("\nPer-class HD95 / ASSD / NSD (excl bg):")
+        for c in range(1, num_classes):
+            idx = c - 1
+            hdv = float(hd95_per_class_mean_f32[idx].item()) if idx < hd95_per_class_mean_f32.numel() else float("nan")
+            asv = float(assd_per_class_mean_f32[idx].item()) if idx < assd_per_class_mean_f32.numel() else float("nan")
+            nsv = float(nsd_per_class_mean_f32[idx].item()) if idx < nsd_per_class_mean_f32.numel() else float("nan")
+            print(f"  [{c:02d}] {class_names[c]:>10s} : HD95={hdv:.6f} | ASSD={asv:.6f} | NSD={nsv:.6f}")
+
+    if writer is not None:
+        writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
+        if compute_hd95:
+            writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        if compute_assd:
+            writer.add_scalar(f"{prefix}/assd_mean_excl_bg", assd_mean_excl_bg, global_step)
+        if compute_nsd:
+            writer.add_scalar(f"{prefix}/nsd_mean_excl_bg", nsd_mean_excl_bg, global_step)
+
+        for c in range(num_classes):
+            writer.add_scalar(
+                f"{prefix}/per_class_dice/{class_names[c]}",
+                float(dice_per_class_mean_f32[c].item()) if not torch.isnan(dice_per_class_mean_f32[c]) else float("nan"),
+                global_step,
+            )
+
+        if fg_classes > 0:
+            for idx in range(fg_classes):
+                writer.add_scalar(
+                    f"{prefix}/per_class_hd95/{class_names[idx + 1]}",
+                    float(hd95_per_class_mean_f32[idx].item()) if not torch.isnan(hd95_per_class_mean_f32[idx]) else float("nan"),
+                    global_step,
+                )
+                writer.add_scalar(
+                    f"{prefix}/per_class_assd/{class_names[idx + 1]}",
+                    float(assd_per_class_mean_f32[idx].item()) if not torch.isnan(assd_per_class_mean_f32[idx]) else float("nan"),
+                    global_step,
+                )
+                writer.add_scalar(
+                    f"{prefix}/per_class_nsd/{class_names[idx + 1]}",
+                    float(nsd_per_class_mean_f32[idx].item()) if not torch.isnan(nsd_per_class_mean_f32[idx]) else float("nan"),
+                    global_step,
+                )
+
+    xlsx_path = os.path.join(output_dir, xlsx_filename)
+    summary = {
+        "checkpoint": os.path.abspath(best_ckpt_path),
+        "test_dice_mean_fg": safe_float(dice_mean_fg),
+        "test_dice_mean_incl_bg": safe_float(dice_mean_incl_bg),
+        "test_hd95_mean_excl_bg": safe_float(hd95_mean_excl_bg),
+        "test_assd_mean_excl_bg": safe_float(assd_mean_excl_bg),
+        "test_nsd_mean_excl_bg": safe_float(nsd_mean_excl_bg),
+        "nsd_tol_mm": float(nsd_tol_mm),
+        "num_classes": int(num_classes),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    per_class_rows: List[Dict[str, Any]] = []
+    for c in range(num_classes):
+        row = {
+            "class_index": c,
+            "class_name": class_names[c],
+            "dice_mean": safe_float(float(dice_per_class_mean_f32[c].item())) if not torch.isnan(dice_per_class_mean_f32[c]) else None,
+            "hd95_mean": None,
+            "assd_mean": None,
+            "nsd_mean": None,
+        }
+        if c >= 1 and (c - 1) < hd95_per_class_mean_f32.numel():
+            idx = c - 1
+            row["hd95_mean"] = (
+                safe_float(float(hd95_per_class_mean_f32[idx].item()))
+                if not torch.isnan(hd95_per_class_mean_f32[idx]) else None
+            )
+            row["assd_mean"] = (
+                safe_float(float(assd_per_class_mean_f32[idx].item()))
+                if not torch.isnan(assd_per_class_mean_f32[idx]) else None
+            )
+            row["nsd_mean"] = (
+                safe_float(float(nsd_per_class_mean_f32[idx].item()))
+                if not torch.isnan(nsd_per_class_mean_f32[idx]) else None
+            )
+        per_class_rows.append(row)
+
+    per_case_rows = [
+        {
+            "case_id": r["case_id"],
+            "dice_mean_fg": r["dice_mean_fg"],
+            "hd95_mean_excl_bg": r["hd95_mean_excl_bg"],
+            "assd_mean_excl_bg": r["assd_mean_excl_bg"],
+            "nsd_mean_excl_bg": r["nsd_mean_excl_bg"],
+        }
+        for r in case_rows_sorted
+    ]
+
+    save_test_metrics_excel(
+        xlsx_path=xlsx_path,
+        summary=summary,
+        per_class_rows=per_class_rows,
+        per_case_rows=per_case_rows,
+        per_case_per_class_rows=per_case_per_class_rows,
+    )
+    print(f"[{report_title}] Excel report saved: {xlsx_path}")
+
+    return {
+        "checkpoint": best_ckpt_path,
+        "dice_mean_incl_bg": dice_mean_incl_bg,
+        "dice_mean_fg": dice_mean_fg,
+        "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "assd_mean_excl_bg": assd_mean_excl_bg,
+        "nsd_mean_excl_bg": nsd_mean_excl_bg,
+        "nsd_tol_mm": float(nsd_tol_mm),
+        "dice_per_class_incl_bg": dice_per_class_mean_f32,
+        "hd95_per_class_excl_bg": hd95_per_class_mean_f32,
+        "assd_per_class_excl_bg": assd_per_class_mean_f32,
+        "nsd_per_class_excl_bg": nsd_per_class_mean_f32,
+        "case_rows": case_rows_sorted,
+        "excel_path": xlsx_path,
+    }
+
+
+def run_single_experiment(args: argparse.Namespace) -> Dict[str, Any]:
+
+    run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.output_root, f"btcv_run_{run_id}")
+    os.makedirs(output_dir, exist_ok=True)
+    print("output_dir =", output_dir)
+
+    save_code_snapshot(output_dir=output_dir, extra_rel_paths=list(args.snapshot_extra))
+
+    print_config()
+    directory = os.environ.get("MONAI_DATA_DIRECTORY")
+    if directory is not None:
+        os.makedirs(directory, exist_ok=True)
+    root_dir = tempfile.mkdtemp() if directory is None else directory
+    print("MONAI root_dir =", root_dir)
+
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device =", device)
+
+    seed_everything(args.seed)
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+        print("[WARN] cudnn_benchmark=True may reduce reproducibility even with fixed seeds.")
+
+    json_path = os.path.join(args.data_dir, args.split_json)
+
+    pixdim = tuple(args.pixdim)
+    roi_size = tuple(args.roi_size)
+    num_classes = int(args.num_classes)
+    class_names = get_class_names(num_classes)
+
+    if int(args.cv_num_folds) != 5:
+        raise ValueError(f"This script now runs in 5-fold CV mode only, got cv_num_folds={args.cv_num_folds}")
+    if int(args.cv_fold_index) < 0 or int(args.cv_fold_index) >= int(args.cv_num_folds):
+        raise ValueError(
+            f"cv_fold_index must be in [0, {int(args.cv_num_folds) - 1}], got {args.cv_fold_index}"
+        )
+    cv_splits = build_kfold_splits_from_json(
+        json_path=json_path,
+        pool_keys=args.pool_keys,
+        n_splits=args.cv_num_folds,
+        split_seed=args.split_seed,
+        exclude_cases=args.exclude_cases,
+    )
+    train_files, val_files = cv_splits[int(args.cv_fold_index)]
+
+    test_files = list(val_files)
+    val_source = f"cv_fold_{int(args.cv_fold_index) + 1}_val"
+
+    print("\n================ 5-FOLD CV SPLIT ================")
+    print(f"[POOL] keys={args.pool_keys} | split_seed={args.split_seed}")
+    print(f"[EXCL] exclude_cases={args.exclude_cases if args.exclude_cases else '[] (no exclusion)'}")
+    print(f"[CV  ] fold={int(args.cv_fold_index) + 1}/{int(args.cv_num_folds)}")
+    print(f"[VAL ] val_source={val_source} | val_start_iter={args.val_start_iter}")
+    print(f"[SPLIT] train={len(train_files)} | val={len(val_files)}")
+    print("==================================================\n")
+
+    cfg = vars(args).copy()
+    cfg.update(
+        {
+            "output_dir": output_dir,
+            "json_path": json_path,
+            "pixdim": pixdim,
+            "roi_size": roi_size,
+            "device": str(device),
+            "class_names": class_names,
+            "class_labels": CLASS_LABELS,
+            "best_selection_metric": "val/dice_mean_fg (foreground only)",
+            "early_stop_metric": "val/dice_mean_fg (foreground only)",
+            "test_report_metrics": [
+                "test/dice_mean_fg (foreground only, best.pt)",
+                "test/hd95_mean_excl_bg (foreground only, best.pt)",
+                "test/assd_mean_excl_bg (foreground only, best.pt)",
+                "test/nsd_mean_excl_bg (foreground only, best.pt)",
+            ],
+            "sw_infer_mode": "gaussian",
+            "exclude_cases": list(args.exclude_cases),
+            "code_snapshot_dir": os.path.join(output_dir, "snapshot"),
+            "val_source": val_source,
+            "val_start_iter": int(args.val_start_iter),
+            "effective_split_sizes": {
+                "train": int(len(train_files)),
+                "val": int(len(val_files)),
+            },
+            "nsd_tol_mm_default": float(DEFAULT_NSD_TOL_MM),
+            "cv_mode": True,
+            "cv_num_folds": int(args.cv_num_folds),
+            "cv_fold_index": int(args.cv_fold_index) + 1,
+            "final_eval_split": "validation",
+            "test_alias_of_val": True,
+        }
+    )
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
+    writer.add_text("meta/output_dir", output_dir, 0)
+    writer.add_text("meta/json_path", json_path, 0)
+    writer.add_text("meta/sw_infer_mode", "gaussian", 0)
+    writer.add_text("meta/sw_overlap", str(args.sw_overlap), 0)
+    writer.add_text("meta/topk", str(args.topk), 0)
+    writer.add_text("meta/exclude_cases", ",".join(list(args.exclude_cases)) if args.exclude_cases else "", 0)
+    writer.add_text("meta/code_snapshot_dir", os.path.join(output_dir, "snapshot"), 0)
+    writer.add_text("meta/val_source", val_source, 0)
+    writer.add_text("meta/val_start_iter", str(args.val_start_iter), 0)
+    writer.add_text("meta/cv_num_folds", str(args.cv_num_folds), 0)
+    writer.add_text("meta/cv_fold_index", str(int(args.cv_fold_index) + 1), 0)
+
+    train_transforms = Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(
+                keys=["image", "label"],
+                axcodes="RAS",
+                labels=(("L", "R"), ("P", "A"), ("I", "S")),
+            ),
+            Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+            ScaleIntensityRanged(
+                keys=["image"],
+                a_min=-175,
+                a_max=250,
+                b_min=0.0,
+                b_max=1.0,
+                clip=True,
+            ),
+            CropForegroundd(keys=["image", "label"], source_key="image", allow_smaller=True),
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=roi_size,
+                pos=1,
+                neg=1,
+                num_samples=args.num_samples,
+                image_key="image",
+                image_threshold=0,
+            ),
+            RandAffined(
+                keys=["image", "label"],
+                prob=0.20,
+                rotate_range=(rot, rot, rot),
+                scale_range=(0.10, 0.10, 0.10),
+                mode=("bilinear", "nearest"),
+                padding_mode="border",
+            ),
+            RandShiftIntensityd(keys=["image"], offsets=0.10, prob=0.50),
+            RandScaleIntensityd(keys=["image"], factors=0.10, prob=0.25),
+            RandGaussianNoised(keys=["image"], std=0.01, prob=0.15),
+        ]
+    )
+
+    eval_transforms = Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Orientationd(
+                keys=["image", "label"],
+                axcodes="RAS",
+                labels=(("L", "R"), ("P", "A"), ("I", "S")),
+            ),
+            Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+            ScaleIntensityRanged(
+                keys=["image"],
+                a_min=-175,
+                a_max=250,
+                b_min=0.0,
+                b_max=1.0,
+                clip=True,
+            ),
+            CropForegroundd(keys=["image", "label"], source_key="image", allow_smaller=True),
+        ]
+    )
+
+    train_list_path = os.path.join(output_dir, "train_files_list.json")
+    val_list_path = os.path.join(output_dir, "val_files_list.json")
+    test_list_path = os.path.join(output_dir, "test_files_list.json")
+    with open(train_list_path, "w") as f:
+        json.dump(train_files, f, indent=2)
+    with open(val_list_path, "w") as f:
+        json.dump(val_files, f, indent=2)
+    with open(test_list_path, "w") as f:
+        json.dump(test_files, f, indent=2)
+
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
+    cache_num_train = len(train_files) if args.cache_num_train <= 0 else min(args.cache_num_train, len(train_files))
+    train_ds = CacheDataset(
+        data=train_files,
+        transform=train_transforms,
+        cache_num=cache_num_train,
+        cache_rate=args.cache_rate,
+        num_workers=args.num_workers_train,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers_train,
+        pin_memory=True,
+        collate_fn=list_data_collate,
+        persistent_workers=(args.num_workers_train > 0),
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    val_ds = None
+    val_loader = None
+    test_ds = None
+    test_loader = None
+
+    cache_num_val = len(val_files) if args.cache_num_val <= 0 else min(args.cache_num_val, len(val_files))
+    cache_num_test = len(test_files) if args.cache_num_test <= 0 else min(args.cache_num_test, len(test_files))
+
+    def ensure_val_loader() -> DataLoader:
+        nonlocal val_ds, val_loader
+        if val_loader is not None:
+            return val_loader
+        val_ds = CacheDataset(
+            data=val_files,
+            transform=eval_transforms,
+            cache_num=cache_num_val,
+            cache_rate=args.cache_rate,
+            num_workers=args.num_workers_val,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers_val,
+            pin_memory=True,
+            persistent_workers=(args.num_workers_val > 0),
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+        print(f"[VAL] loader built (lazy) | size={len(val_files)} | cache_num={cache_num_val}")
+        return val_loader
+
+    def ensure_test_loader() -> DataLoader:
+        nonlocal test_ds, test_loader, val_ds, val_loader
+        if test_loader is not None:
+            return test_loader
+
+        if (
+            (val_source == "test_as_val")
+            and (val_loader is not None)
+            and (args.num_workers_test == args.num_workers_val)
+            and (cache_num_test == cache_num_val)
+        ):
+            test_loader = val_loader
+            test_ds = val_ds
+            print("[TEST] reuse val_loader as test_loader (val=test)")
+            return test_loader
+
+        test_ds = CacheDataset(
+            data=test_files,
+            transform=eval_transforms,
+            cache_num=cache_num_test,
+            cache_rate=args.cache_rate,
+            num_workers=args.num_workers_test,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers_test,
+            pin_memory=True,
+            persistent_workers=(args.num_workers_test > 0),
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+        print(f"[TEST] loader built (lazy) | size={len(test_files)} | cache_num={cache_num_test}")
+        return test_loader
+
+    model = VNet(n_channels=1, n_classes=num_classes).to(device)
+    #model = UNet3D(in_channels=1,out_channels=14,f_maps=[24, 48, 96, 192]).to(device)
+    #model = MedNeXt3D(in_channels=1, n_channels=16, n_classes=14).to(device)
+    loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
+
+    def build_param_groups(m: torch.nn.Module, weight_decay: float):
+        decay, no_decay = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or n.endswith(".bias") or ("norm" in n.lower()) or ("bn" in n.lower()):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": float(weight_decay)},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    param_groups = build_param_groups(model, weight_decay=float(args.wd))
+
+    optimizer = torch.optim.SGD(
+        param_groups,
+        lr=float(args.lr),
+        momentum=float(args.momentum),
+    )
+
+    scheduler = None
+    if args.use_poly:
+        base_lr = float(args.lr)
+
+        def lr_lambda(step: int):
+            t = min(max(step, 0), int(args.max_iterations))
+            poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
+            return max(float(args.min_lr) / base_lr, poly)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    post_label = AsDiscrete(to_onehot=num_classes)
+    post_pred = AsDiscrete(argmax=True, to_onehot=num_classes)
+
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
+
+    topk = max(1, int(args.topk))
+    topk_dir = os.path.join(output_dir, f"top{topk}")
+    os.makedirs(topk_dir, exist_ok=True)
+    topk_list: List[Tuple[float, int, str]] = []
+
+    def maybe_update_topk(dice_fg: float, step: int) -> None:
+        nonlocal topk_list
+        qualifies = (len(topk_list) < topk) or (dice_fg > topk_list[-1][0])
+        if not qualifies:
+            return
+
+        ckpt_path = os.path.join(topk_dir, f"iter{step:06d}_dice{dice_fg:.6f}.pt")
+        torch.save(model.state_dict(), ckpt_path)
+
+        topk_list.append((float(dice_fg), int(step), ckpt_path))
+        topk_list.sort(key=lambda x: x[0], reverse=True)
+
+        if len(topk_list) > topk:
+            for _, _, p in topk_list[topk:]:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            topk_list = topk_list[:topk]
+
+        with open(os.path.join(output_dir, "topk_checkpoints.json"), "w") as f:
+            json.dump(
+                [{"rank": i + 1, "dice_fg": s, "iter": it, "path": p} for i, (s, it, p) in enumerate(topk_list)],
+                f,
+                indent=2,
+            )
+
+    global_step = 0
+    best_val_dice_fg = -1.0
+    best_step = -1
+    best_path = os.path.join(output_dir, "best.pt")
+
+    eval_history: List[Dict[str, Any]] = []
+    num_evals = 0
+    bad_evals = 0
+    stop_training = False
+    early_stop_reason = ""
+
+    pbar = tqdm(total=args.max_iterations, desc="Training", dynamic_ncols=True)
+    t0 = time.time()
+
+    while (global_step < args.max_iterations) and (not stop_training):
+        model.train()
+        for batch in train_loader:
+            if global_step >= args.max_iterations or stop_training:
+                break
+
+            x = batch["image"].to(device)
+            y = batch["label"].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with autocast(device_type=device.type, enabled=use_amp):
+                logits = model(x)
+                loss = loss_function(logits, y)
+
+            writer.add_scalar("train/loss_total", float(loss.item()), global_step)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            global_step += 1
+            pbar.update(1)
+
+            lr_now = optimizer.param_groups[0]["lr"]
+            writer.add_scalar("train/loss", float(loss.item()), global_step)
+            writer.add_scalar("train/lr", float(lr_now), global_step)
+            pbar.set_description(f"Training iter={global_step}/{args.max_iterations} loss={loss.item():.5f}")
+
+            do_eval_now = ((global_step % args.eval_num == 0) or (global_step == args.max_iterations))
+            if do_eval_now and (global_step >= int(args.val_start_iter)):
+                prev_best = float(best_val_dice_fg)
+
+                vloader = ensure_val_loader()
+                val_res = run_evaluation_single_model(
+                    model=model,
+                    loader=vloader,
+                    device=device,
+                    roi_size=roi_size,
+                    sw_batch_size=args.sw_batch_size,
+                    sw_overlap=args.sw_overlap,
+                    num_classes=num_classes,
+                    class_names=class_names,
+                    post_label=post_label,
+                    post_pred=post_pred,
+                    global_step=global_step,
+                    writer=writer,
+                    prefix="val",
+                    compute_hd95=False,
+                )
+                model.train()
+                dice_fg = float(val_res["dice_mean_fg"])
+                dice_incl_bg = float(val_res["dice_mean_incl_bg"])
+
+                eval_history.append(
+                    {
+                        "iter": int(global_step),
+                        "train_loss_at_eval": float(loss.item()),
+                        "val_dice_mean_fg": safe_float(dice_fg),
+                        "val_dice_mean_incl_bg": safe_float(dice_incl_bg),
+                        "val_source": val_source,
+                        "val_dice_per_class_incl_bg": tensor_to_float_list(val_res["dice_per_class_incl_bg"]),
+                    }
+                )
+
+                maybe_update_topk(dice_fg=dice_fg, step=global_step)
+
+                if dice_fg > best_val_dice_fg:
+                    best_val_dice_fg = float(dice_fg)
+                    best_step = int(global_step)
+                    torch.save(model.state_dict(), best_path)
+                    print(
+                        f"[SAVE] best.pt @ iter={best_step} | best_val_dice_fg={best_val_dice_fg:.4f} "
+                        f"| val_dice_incl_bg={dice_incl_bg:.4f}"
+                    )
+                else:
+                    print(
+                        f"[NOSAVE] best_val_dice_fg={best_val_dice_fg:.4f} | current_val_dice_fg={dice_fg:.4f} "
+                        f"| val_dice_incl_bg={dice_incl_bg:.4f}"
+                    )
+
+                num_evals += 1
+                improved_for_early_stop = dice_fg > (prev_best + args.early_stop_min_delta)
+                if improved_for_early_stop:
+                    bad_evals = 0
+                else:
+                    if num_evals > args.early_stop_warmup:
+                        bad_evals += 1
+
+                writer.add_scalar("train/early_stop_bad_evals", bad_evals, global_step)
+                writer.add_scalar("train/best_val_dice_mean_fg", float(best_val_dice_fg), global_step)
+
+                if (num_evals > args.early_stop_warmup) and (bad_evals >= args.early_stop_patience):
+                    stop_training = True
+                    early_stop_reason = (
+                        f"no improvement in val foreground Dice for {bad_evals} validations "
+                        f"(patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta})"
+                    )
+                    print(f"[EARLY STOP] iter={global_step} | {early_stop_reason}")
+                    writer.add_text("meta/early_stop_reason", early_stop_reason, global_step)
+                    break
+
+    pbar.close()
+    dt = time.time() - t0
+    print(f"Training finished. Time: {dt/60:.1f} min")
+    writer.add_scalar("meta/train_minutes", dt / 60.0, global_step)
+
+    if stop_training:
+        print(f"Stopped early at iter={global_step}. Reason: {early_stop_reason}")
+
+    fold_metrics: Dict[str, Any] = {}
+
+    if os.path.isfile(best_path):
+        vloader = ensure_val_loader()
+        fold_res = run_test_best_and_export_excel(
+            model=model,
+            best_ckpt_path=best_path,
+            loader=vloader,
+            device=device,
+            roi_size=roi_size,
+            sw_batch_size=args.sw_batch_size,
+            sw_overlap=args.sw_overlap,
+            num_classes=num_classes,
+            class_names=class_names,
+            post_label=post_label,
+            post_pred=post_pred,
+            global_step=best_step if best_step > 0 else global_step,
+            output_dir=output_dir,
+            writer=writer,
+            prefix=f"fold{int(args.cv_fold_index) + 1}_val",
+            report_title=f"FOLD{int(args.cv_fold_index) + 1}_VAL",
+            xlsx_filename="fold_metrics.xlsx",
+            compute_hd95=True,
+            compute_assd=True,
+            compute_nsd=True,
+            pixdim=pixdim,
+            nsd_tol_mm=DEFAULT_NSD_TOL_MM,
+        )
+
+        fold_metrics = {
+            "eval_split": "validation",
+            "cv_mode": True,
+            "cv_num_folds": int(args.cv_num_folds),
+            "cv_fold_index": int(args.cv_fold_index) + 1,
+            "checkpoint": best_path,
+            "best_path": best_path,
+            "best_iter": int(best_step),
+            "best_selection_metric": "val/dice_mean_fg (foreground only)",
+            "best_val_dice_mean_fg": safe_float(best_val_dice_fg),
+            "metric_definition": "dice_mean_fg = mean Dice over classes 1..C-1 (mean-over-cases per class, ignore empty)",
+            "dice_mean_fg": safe_float(float(fold_res["dice_mean_fg"])),
+            "dice_mean_incl_bg": safe_float(float(fold_res["dice_mean_incl_bg"])),
+            "hd95_mean_excl_bg": safe_float(float(fold_res["hd95_mean_excl_bg"])),
+            "assd_mean_excl_bg": safe_float(float(fold_res["assd_mean_excl_bg"])),
+            "nsd_mean_excl_bg": safe_float(float(fold_res["nsd_mean_excl_bg"])),
+            "nsd_tol_mm": safe_float(float(fold_res["nsd_tol_mm"])),
+            "dice_per_class_incl_bg": tensor_to_float_list(fold_res["dice_per_class_incl_bg"]),
+            "hd95_per_class_excl_bg": tensor_to_float_list(fold_res["hd95_per_class_excl_bg"]),
+            "assd_per_class_excl_bg": tensor_to_float_list(fold_res["assd_per_class_excl_bg"]),
+            "nsd_per_class_excl_bg": tensor_to_float_list(fold_res["nsd_per_class_excl_bg"]),
+            "case_rows_sorted_by_fg_dice": fold_res["case_rows"],
+            "excel_path": fold_res["excel_path"],
+            "class_names": class_names,
+            "class_labels": CLASS_LABELS,
+            "early_stopped": bool(stop_training),
+            "early_stop_reason": early_stop_reason,
+            "early_stop_patience": int(args.early_stop_patience),
+            "early_stop_min_delta": float(args.early_stop_min_delta),
+            "early_stop_warmup": int(args.early_stop_warmup),
+            "val_start_iter": int(args.val_start_iter),
+            "split": {
+                "pool_keys": list(args.pool_keys),
+                "split_seed": int(args.split_seed),
+                "exclude_cases": list(args.exclude_cases),
+                "train_size": int(len(train_files)),
+                "val_size": int(len(val_files)),
+            },
+            "sw_infer": {"mode": "gaussian", "overlap": float(args.sw_overlap)},
+        }
+
+        with open(os.path.join(output_dir, "fold_metrics.json"), "w") as f:
+            json.dump(fold_metrics, f, indent=2)
+    else:
+        print(f"[WARN] best.pt not found, skip fold evaluation. expected: {best_path}")
+
+    with open(os.path.join(output_dir, "eval_history.json"), "w") as f:
+        json.dump(eval_history, f, indent=2)
+
+    writer.close()
+
+    print("\nSaved artifacts:")
+    print(" -", os.path.join(output_dir, "config.json"))
+    print(" -", os.path.join(output_dir, "tb"))
+    print(" -", os.path.join(output_dir, "snapshot"))
+    print(" -", best_path)
+    print(" -", os.path.join(output_dir, "topk_checkpoints.json"))
+    print(" -", os.path.join(output_dir, "fold_metrics.json"))
+    print(" -", os.path.join(output_dir, "fold_metrics.xlsx"))
+    print(" -", os.path.join(output_dir, "eval_history.json"))
+    print(" -", os.path.join(output_dir, "train_files_list.json"))
+    print(" -", os.path.join(output_dir, "val_files_list.json"))
+    print(" -", os.path.join(output_dir, "test_files_list.json"))
+
+    return {
+        "output_dir": output_dir,
+        "fold_metrics": fold_metrics,
+        "class_names": class_names,
+        "split_seed": int(args.split_seed),
+        "seed": int(args.seed),
+        "cv_fold_index": int(args.cv_fold_index) + 1,
+    }
+
+
+def _nanmean(values: List[Optional[float]]) -> Optional[float]:
+    vals = [float(v) for v in values if v is not None and not math.isnan(float(v)) and not math.isinf(float(v))]
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+
+def save_crossval_summary_excel(xlsx_path: str, fold_results: List[Dict[str, Any]], class_names: List[str]) -> None:
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "fold_metrics"
+    fold_headers = [
+        "fold_index", "fold_name", "split_seed", "seed",
+        "dice_mean_fg", "hd95_mean_excl_bg", "assd_mean_excl_bg", "nsd_mean_excl_bg",
+        "fold_metrics_json", "fold_metrics_xlsx",
+    ]
+    ws.append(fold_headers)
+    for r in fold_results:
+        ws.append([
+            r.get("fold_index"),
+            r.get("fold_name"),
+            r.get("split_seed"),
+            r.get("seed"),
+            r.get("dice_mean_fg"),
+            r.get("hd95_mean_excl_bg"),
+            r.get("assd_mean_excl_bg"),
+            r.get("nsd_mean_excl_bg"),
+            r.get("fold_metrics_json"),
+            r.get("fold_metrics_xlsx"),
+        ])
+    ws.freeze_panes = "A2"
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws)
+
+    ws2 = wb.create_sheet("overall_avg")
+    ws2.append(["metric", "mean_over_5_folds"])
+    ws2.append(["dice_mean_fg", _nanmean([r.get("dice_mean_fg") for r in fold_results])])
+    ws2.append(["hd95_mean_excl_bg", _nanmean([r.get("hd95_mean_excl_bg") for r in fold_results])])
+    ws2.append(["assd_mean_excl_bg", _nanmean([r.get("assd_mean_excl_bg") for r in fold_results])])
+    ws2.append(["nsd_mean_excl_bg", _nanmean([r.get("nsd_mean_excl_bg") for r in fold_results])])
+    ws2.freeze_panes = "A2"
+    for c in ws2[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws2)
+
+    ws3 = wb.create_sheet("per_organ_avg")
+    organ_headers = ["class_index", "class_name", "dice_mean", "hd95_mean", "assd_mean", "nsd_mean"]
+    ws3.append(organ_headers)
+    for c in range(1, len(class_names)):
+        dice_vals = []
+        hd95_vals = []
+        assd_vals = []
+        nsd_vals = []
+        for r in fold_results:
+            dpc = r.get("dice_per_class_incl_bg") or []
+            if c < len(dpc):
+                dice_vals.append(dpc[c])
+            idx = c - 1
+            hpc = r.get("hd95_per_class_excl_bg") or []
+            apc = r.get("assd_per_class_excl_bg") or []
+            npc = r.get("nsd_per_class_excl_bg") or []
+            if idx < len(hpc):
+                hd95_vals.append(hpc[idx])
+            if idx < len(apc):
+                assd_vals.append(apc[idx])
+            if idx < len(npc):
+                nsd_vals.append(npc[idx])
+        ws3.append([
+            c,
+            class_names[c],
+            _nanmean(dice_vals),
+            _nanmean(hd95_vals),
+            _nanmean(assd_vals),
+            _nanmean(nsd_vals),
+        ])
+
+    ws3.freeze_panes = "A2"
+    for c in ws3[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center")
+    _excel_autofit(ws3)
+
+    wb.save(xlsx_path)
+
+
+def _strip_batch_args(argv: List[str]) -> List[str]:
+    value_flags = {
+        "--run_name",
+        "--split_seed",
+        "--seed",
+        "--multi_run_count",
+        "--multi_run_seed_start",
+        "--multi_run_seed_step",
+        "--cv_num_folds",
+        "--cv_fold_index",
+    }
+    switch_flags = {"--single_run", "--multi_run"}
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in switch_flags:
+            i += 1
+            continue
+        if tok in value_flags:
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def main():
+    args = parse_args()
+
+    if args.single_run:
+        run_single_experiment(args)
+        return
+
+    if int(args.cv_num_folds) != 5:
+        raise ValueError(f"This script now runs in 5-fold CV mode only, got cv_num_folds={args.cv_num_folds}")
+
+    base_run_name = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
+    shared_argv = _strip_batch_args(sys.argv[1:])
+
+    all_results: List[Dict[str, Any]] = []
+    class_names = get_class_names(int(args.num_classes))
+
+    for fold_idx in range(int(args.cv_num_folds)):
+        sub_run_name = f"{base_run_name}_fold{fold_idx + 1}"
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            *shared_argv,
+            "--single_run",
+            "--run_name",
+            sub_run_name,
+            "--cv_num_folds",
+            str(args.cv_num_folds),
+            "--cv_fold_index",
+            str(fold_idx),
+            "--split_seed",
+            str(args.split_seed),
+            "--seed",
+            str(args.seed),
+        ]
+        print(f"\n[5-FOLD CV] ({fold_idx + 1}/{int(args.cv_num_folds)}) fold={fold_idx + 1}")
+        print("[5-FOLD CV] cmd:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+        sub_out_dir = os.path.join(args.output_root, f"btcv_run_{sub_run_name}")
+        metrics_json = os.path.join(sub_out_dir, "fold_metrics.json")
+        metrics_xlsx = os.path.join(sub_out_dir, "fold_metrics.xlsx")
+        with open(metrics_json, "r") as f:
+            fm = json.load(f)
+
+        all_results.append({
+            "fold_index": fold_idx + 1,
+            "fold_name": sub_run_name,
+            "split_seed": int(args.split_seed),
+            "seed": int(args.seed),
+            "dice_mean_fg": safe_float(fm.get("dice_mean_fg")),
+            "hd95_mean_excl_bg": safe_float(fm.get("hd95_mean_excl_bg")),
+            "assd_mean_excl_bg": safe_float(fm.get("assd_mean_excl_bg")),
+            "nsd_mean_excl_bg": safe_float(fm.get("nsd_mean_excl_bg")),
+            "dice_per_class_incl_bg": fm.get("dice_per_class_incl_bg", []),
+            "hd95_per_class_excl_bg": fm.get("hd95_per_class_excl_bg", []),
+            "assd_per_class_excl_bg": fm.get("assd_per_class_excl_bg", []),
+            "nsd_per_class_excl_bg": fm.get("nsd_per_class_excl_bg", []),
+            "fold_metrics_json": metrics_json,
+            "fold_metrics_xlsx": metrics_xlsx,
+        })
+
+    summary_xlsx = os.path.join(args.output_root, f"btcv_run_{base_run_name}_5fold_summary.xlsx")
+    save_crossval_summary_excel(summary_xlsx, all_results, class_names)
+    print(f"[5-FOLD CV] summary excel saved: {summary_xlsx}")
+
+
+if __name__ == "__main__":
+    main()

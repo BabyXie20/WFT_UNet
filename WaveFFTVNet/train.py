@@ -69,6 +69,22 @@ CLASS_LABELS = {
     "13": "lad",
 }
 
+
+FIXED_EVAL_CASES = [
+    {"image": "../data/btcv/imagesTr/img0027.nii.gz", "label": "../data/btcv/labelsTr/label0027.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0010.nii.gz", "label": "../data/btcv/labelsTr/label0010.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0022.nii.gz", "label": "../data/btcv/labelsTr/label0022.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0030.nii.gz", "label": "../data/btcv/labelsTr/label0030.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0005.nii.gz", "label": "../data/btcv/labelsTr/label0005.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0032.nii.gz", "label": "../data/btcv/labelsTr/label0032.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0008.nii.gz", "label": "../data/btcv/labelsTr/label0008.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0007.nii.gz", "label": "../data/btcv/labelsTr/label0007.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0001.nii.gz", "label": "../data/btcv/labelsTr/label0001.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0025.nii.gz", "label": "../data/btcv/labelsTr/label0025.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0034.nii.gz", "label": "../data/btcv/labelsTr/label0034.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0036.nii.gz", "label": "../data/btcv/labelsTr/label0036.nii.gz"},
+]
+
 rot = np.deg2rad(30.0)
 
 
@@ -125,28 +141,7 @@ def parse_args():
         default=0,
         help="ignore early-stop counting for first N validations",
     )
-    parser.add_argument(
-        "--pool_keys",
-        type=str,
-        nargs="+",
-        default=["training", "validation"],
-        help="take labeled cases from these json keys and merge as pool (must contain image+label pairs)",
-    )
     parser.add_argument("--train_num", type=int, default=18, help="number of train cases (default 18)")
-    parser.add_argument(
-        "--val_num",
-        type=int,
-        default=12,
-        help="number of validation cases (ONLY used when --val_separate is set). Default 12.",
-    )
-    parser.add_argument("--test_num", type=int, default=12, help="number of test cases (default 12)")
-    parser.add_argument(
-        "--val_separate",
-        action="store_true",
-        help="if set, split into independent val and test sets using val_num/test_num. "
-        "If not set (default), val set will be identical to test set.",
-    )
-    parser.add_argument("--split_seed", type=int, default=123, help="seed for deterministic split shuffling")
     parser.add_argument(
         "--snapshot_extra",
         type=str,
@@ -355,18 +350,18 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
     print(f"[SNAPSHOT] items: {len(copied)} (meta written: snapshot_meta.json)")
 
 
-def build_custom_splits_from_json(
+def build_fixed_splits_from_json(
     json_path: str,
-    pool_keys: List[str],
     train_num: int,
-    val_num: int,
-    test_num: int,
-    split_seed: int,
+    eval_cases: List[Dict[str, str]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     pool: List[Dict[str, Any]] = []
-    for k in pool_keys:
-        part = load_decathlon_datalist(json_path, True, k)
-        pool.extend(part)
+    for k in ["training", "validation"]:
+        try:
+            part = load_decathlon_datalist(json_path, True, k)
+            pool.extend(part)
+        except Exception:
+            continue
 
     uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for d in pool:
@@ -374,29 +369,40 @@ def build_custom_splits_from_json(
         if not key[0] or not key[1]:
             continue
         uniq[key] = d
-    pool = list(uniq.values())
 
-    rng = random.Random(int(split_seed))
-    rng.shuffle(pool)
+    all_cases = list(uniq.values())
 
-    total = len(pool)
-    val_num = max(0, int(val_num))
-    test_num = max(0, int(test_num))
+    def norm_case_key(image_path: str, label_path: str) -> Tuple[str, str]:
+        return (os.path.normpath(image_path).replace("\\", "/"), os.path.normpath(label_path).replace("\\", "/"))
+
+    eval_key_to_case: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for d in all_cases:
+        eval_key_to_case[norm_case_key(d.get("image", ""), d.get("label", ""))] = d
+
+    val_files: List[Dict[str, Any]] = []
+    missing_eval: List[Dict[str, str]] = []
+    for ec in eval_cases:
+        key = norm_case_key(ec["image"], ec["label"])
+        matched = eval_key_to_case.get(key)
+        if matched is None:
+            missing_eval.append(ec)
+        else:
+            val_files.append(matched)
+
+    if missing_eval:
+        miss = json.dumps(missing_eval, ensure_ascii=False)
+        raise RuntimeError(f"Fixed eval cases not found in dataset json: {miss}")
+
+    eval_keys = {norm_case_key(d.get("image", ""), d.get("label", "")) for d in val_files}
+    train_pool = [d for d in all_cases if norm_case_key(d.get("image", ""), d.get("label", "")) not in eval_keys]
+
     train_num = int(train_num)
-
-    if val_num + test_num > total:
-        overflow = val_num + test_num - total
-        test_num = max(0, test_num - overflow)
-
-    remain = total - (val_num + test_num)
     if train_num < 0:
-        train_num = remain
+        train_files = train_pool
     else:
-        train_num = min(train_num, remain)
+        train_files = train_pool[: min(train_num, len(train_pool))]
 
-    val_files = pool[:val_num]
-    test_files = pool[val_num : val_num + test_num]
-    train_files = pool[val_num + test_num : val_num + test_num + train_num]
+    test_files = list(val_files)
     return train_files, val_files, test_files
 
 
@@ -932,30 +938,15 @@ def main():
     num_classes = int(args.num_classes)
     class_names = get_class_names(num_classes)
 
-    if args.val_separate:
-        train_files, val_files, test_files = build_custom_splits_from_json(
-            json_path=json_path,
-            pool_keys=args.pool_keys,
-            train_num=args.train_num,
-            val_num=args.val_num,
-            test_num=args.test_num,
-            split_seed=args.split_seed,
-        )
-        val_source = "separate_val"
-    else:
-        train_files, _empty_val, test_files = build_custom_splits_from_json(
-            json_path=json_path,
-            pool_keys=args.pool_keys,
-            train_num=args.train_num,
-            val_num=0,
-            test_num=args.test_num,
-            split_seed=args.split_seed,
-        )
-        val_files = list(test_files)
-        val_source = "test_as_val"
+    train_files, val_files, test_files = build_fixed_splits_from_json(
+        json_path=json_path,
+        train_num=args.train_num,
+        eval_cases=FIXED_EVAL_CASES,
+    )
+    val_source = "fixed_test_as_val"
 
     print("\n================ SPLIT ================")
-    print(f"[POOL] keys={args.pool_keys} | split_seed={args.split_seed}")
+    print("[POOL] source_keys=['training','validation'] | split_seed=REMOVED")
     print(f"[VAL ] val_source={val_source} | val_start_iter={args.val_start_iter}")
     print(f"[SPLIT] train={len(train_files)} | val={len(val_files)} | test={len(test_files)}")
     print("=======================================\n")

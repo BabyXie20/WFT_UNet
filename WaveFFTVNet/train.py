@@ -151,6 +151,8 @@ def parse_args():
     )
 
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--child_run", action="store_true", help="internal flag for multi-seed orchestration")
+    parser.add_argument("--seed_schedule", type=int, nargs="+", default=[123, 1234, 2345], help="seeds to run sequentially when not child_run")
     parser.add_argument("--amp", action="store_true", help="use mixed precision")
     parser.add_argument("--cudnn_benchmark", action="store_true", help="torch.backends.cudnn.benchmark=True")
 
@@ -883,7 +885,15 @@ def save_test_results_csv(
     with open(case_ranking_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["rank_ascending_fg_dice", "case_id", "dice_mean_fg", "is_outlier", "hd95_per_class_excl_bg", "nsd_per_class_excl_bg"],
+            fieldnames=[
+                "rank_ascending_fg_dice",
+                "case_id",
+                "dice_mean_fg",
+                "is_outlier",
+                "dice_per_class_incl_bg",
+                "hd95_per_class_excl_bg",
+                "nsd_per_class_excl_bg",
+            ],
         )
         writer.writeheader()
         for row in case_rows:
@@ -893,6 +903,7 @@ def save_test_results_csv(
                     "case_id": row["case_id"],
                     "dice_mean_fg": safe_float(row["dice_mean_fg"]),
                     "is_outlier": bool(row["is_outlier"]),
+                    "dice_per_class_incl_bg": json.dumps(row.get("dice_per_class_incl_bg", []), ensure_ascii=False),
                     "hd95_per_class_excl_bg": json.dumps(row.get("hd95_per_class_excl_bg", []), ensure_ascii=False),
                     "nsd_per_class_excl_bg": json.dumps(row.get("nsd_per_class_excl_bg", []), ensure_ascii=False),
                 }
@@ -905,8 +916,7 @@ def save_test_results_csv(
     }
 
 
-def main():
-    args = parse_args()
+def run_single_experiment(args):
 
     run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(args.output_root, f"btcv_run_{run_id}")
@@ -1403,6 +1413,210 @@ def main():
         print(" -", test_csv_paths["summary_csv"])
         print(" -", test_csv_paths["per_class_csv"])
         print(" -", test_csv_paths["case_ranking_csv"])
+
+
+
+def _nanmean_nanvar(values: List[float]) -> Tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    return float(np.mean(arr)), float(np.var(arr))
+
+
+def aggregate_multi_seed_case_metrics(
+    run_dirs: List[str],
+    class_names: List[str],
+    output_dir: str,
+) -> Dict[str, str]:
+    os.makedirs(output_dir, exist_ok=True)
+
+    fg_class_names = class_names[1:]
+    all_values = {"dice": [], "hd95": [], "nsd": []}
+    per_class_values = {
+        "dice": {i: [] for i in range(len(fg_class_names))},
+        "hd95": {i: [] for i in range(len(fg_class_names))},
+        "nsd": {i: [] for i in range(len(fg_class_names))},
+    }
+
+    for run_dir in run_dirs:
+        case_csv = os.path.join(run_dir, "test_case_ranking.csv")
+        if not os.path.isfile(case_csv):
+            raise RuntimeError(f"missing test_case_ranking.csv for run: {run_dir}")
+
+        with open(case_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                dice_list = json.loads(row.get("dice_per_class_incl_bg", "[]"))
+                hd95_list = json.loads(row.get("hd95_per_class_excl_bg", "[]"))
+                nsd_list = json.loads(row.get("nsd_per_class_excl_bg", "[]"))
+
+                dice_fg = dice_list[1:] if len(dice_list) > 1 else []
+                for i, v in enumerate(dice_fg):
+                    if v is None:
+                        continue
+                    fv = float(v)
+                    all_values["dice"].append(fv)
+                    if i in per_class_values["dice"]:
+                        per_class_values["dice"][i].append(fv)
+
+                for metric_name, values in [("hd95", hd95_list), ("nsd", nsd_list)]:
+                    for i, v in enumerate(values):
+                        if v is None:
+                            continue
+                        fv = float(v)
+                        all_values[metric_name].append(fv)
+                        if i in per_class_values[metric_name]:
+                            per_class_values[metric_name][i].append(fv)
+
+    overall_csv = os.path.join(output_dir, "multi_seed_all_case_organ_stats.csv")
+    with open(overall_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["metric", "mean", "variance"])
+        writer.writeheader()
+        for metric in ["dice", "hd95", "nsd"]:
+            m, v = _nanmean_nanvar(all_values[metric])
+            writer.writerow({"metric": metric, "mean": safe_float(m), "variance": safe_float(v)})
+
+    per_class_csv = os.path.join(output_dir, "multi_seed_per_organ_stats.csv")
+    with open(per_class_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["class_index", "class_name", "dice_mean", "dice_variance", "hd95_mean", "hd95_variance", "nsd_mean", "nsd_variance"],
+        )
+        writer.writeheader()
+        for i, cname in enumerate(fg_class_names, start=1):
+            dm, dv = _nanmean_nanvar(per_class_values["dice"][i - 1])
+            hm, hv = _nanmean_nanvar(per_class_values["hd95"][i - 1])
+            nm, nv = _nanmean_nanvar(per_class_values["nsd"][i - 1])
+            writer.writerow(
+                {
+                    "class_index": i,
+                    "class_name": cname,
+                    "dice_mean": safe_float(dm),
+                    "dice_variance": safe_float(dv),
+                    "hd95_mean": safe_float(hm),
+                    "hd95_variance": safe_float(hv),
+                    "nsd_mean": safe_float(nm),
+                    "nsd_variance": safe_float(nv),
+                }
+            )
+
+    return {"overall_csv": overall_csv, "per_class_csv": per_class_csv}
+
+
+def main():
+    args = parse_args()
+
+    if args.child_run:
+        run_single_experiment(args)
+        return
+
+    schedule = [int(x) for x in args.seed_schedule]
+    if len(schedule) == 0:
+        schedule = [123, 1234, 2345]
+
+    base_run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
+    multi_run_dir = os.path.join(args.output_root, f"btcv_multirun_{base_run_id}")
+    os.makedirs(multi_run_dir, exist_ok=True)
+
+    run_dirs: List[str] = []
+    class_names = get_class_names(int(args.num_classes))
+    script_path = os.path.abspath(__file__)
+
+    print(f"[MULTI-RUN] seeds={schedule}")
+    for seed in schedule:
+        run_name = f"{base_run_id}_seed{seed}"
+        cmd = [
+            sys.executable,
+            script_path,
+            "--child_run",
+            "--seed",
+            str(seed),
+            "--run_name",
+            run_name,
+            "--data_dir",
+            args.data_dir,
+            "--split_json",
+            args.split_json,
+            "--output_root",
+            args.output_root,
+            "--pixdim",
+            str(args.pixdim[0]),
+            str(args.pixdim[1]),
+            str(args.pixdim[2]),
+            "--roi_size",
+            str(args.roi_size[0]),
+            str(args.roi_size[1]),
+            str(args.roi_size[2]),
+            "--num_classes",
+            str(args.num_classes),
+            "--nsd_tol_mm",
+            str(args.nsd_tol_mm),
+            "--batch_size",
+            str(args.batch_size),
+            "--num_samples",
+            str(args.num_samples),
+            "--cache_num_train",
+            str(args.cache_num_train),
+            "--cache_num_val",
+            str(args.cache_num_val),
+            "--cache_num_test",
+            str(args.cache_num_test),
+            "--cache_rate",
+            str(args.cache_rate),
+            "--num_workers_train",
+            str(args.num_workers_train),
+            "--num_workers_val",
+            str(args.num_workers_val),
+            "--num_workers_test",
+            str(args.num_workers_test),
+            "--max_iterations",
+            str(args.max_iterations),
+            "--eval_num",
+            str(args.eval_num),
+            "--val_start_iter",
+            str(args.val_start_iter),
+            "--sw_batch_size",
+            str(args.sw_batch_size),
+            "--sw_overlap",
+            str(args.sw_overlap),
+            "--lr",
+            str(args.lr),
+            "--wd",
+            str(args.wd),
+            "--momentum",
+            str(args.momentum),
+            "--early_stop_patience",
+            str(args.early_stop_patience),
+            "--early_stop_min_delta",
+            str(args.early_stop_min_delta),
+            "--early_stop_warmup",
+            str(args.early_stop_warmup),
+            "--train_num",
+            str(args.train_num),
+        ]
+
+        if args.snapshot_extra:
+            cmd.extend(["--snapshot_extra", *args.snapshot_extra])
+        if args.amp:
+            cmd.append("--amp")
+        if args.cudnn_benchmark:
+            cmd.append("--cudnn_benchmark")
+
+        print(f"[MULTI-RUN] launch seed={seed} -> run_name={run_name}")
+        subprocess.run(cmd, check=True)
+
+        run_dir = os.path.join(args.output_root, f"btcv_run_{run_name}")
+        run_dirs.append(run_dir)
+
+    stats_paths = aggregate_multi_seed_case_metrics(run_dirs=run_dirs, class_names=class_names, output_dir=multi_run_dir)
+    with open(os.path.join(multi_run_dir, "multi_seed_runs.json"), "w", encoding="utf-8") as f:
+        json.dump({"seeds": schedule, "run_dirs": run_dirs, "stats_paths": stats_paths}, f, indent=2)
+
+    print("\n[MULTI-RUN] saved:")
+    print(" -", stats_paths["overall_csv"])
+    print(" -", stats_paths["per_class_csv"])
+    print(" -", os.path.join(multi_run_dir, "multi_seed_runs.json"))
 
 
 if __name__ == "__main__":

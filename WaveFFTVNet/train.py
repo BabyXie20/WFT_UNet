@@ -32,7 +32,7 @@ from monai.data import (
 )
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
-from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.metrics import DiceMetric, HausdorffDistanceMetric, SurfaceDiceMetric
 from monai.transforms import (
     AsDiscrete,
     Compose,
@@ -69,6 +69,22 @@ CLASS_LABELS = {
     "13": "lad",
 }
 
+
+FIXED_EVAL_CASES = [
+    {"image": "../data/btcv/imagesTr/img0027.nii.gz", "label": "../data/btcv/labelsTr/label0027.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0010.nii.gz", "label": "../data/btcv/labelsTr/label0010.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0022.nii.gz", "label": "../data/btcv/labelsTr/label0022.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0030.nii.gz", "label": "../data/btcv/labelsTr/label0030.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0005.nii.gz", "label": "../data/btcv/labelsTr/label0005.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0032.nii.gz", "label": "../data/btcv/labelsTr/label0032.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0008.nii.gz", "label": "../data/btcv/labelsTr/label0008.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0007.nii.gz", "label": "../data/btcv/labelsTr/label0007.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0001.nii.gz", "label": "../data/btcv/labelsTr/label0001.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0025.nii.gz", "label": "../data/btcv/labelsTr/label0025.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0034.nii.gz", "label": "../data/btcv/labelsTr/label0034.nii.gz"},
+    {"image": "../data/btcv/imagesTr/img0036.nii.gz", "label": "../data/btcv/labelsTr/label0036.nii.gz"},
+]
+
 rot = np.deg2rad(30.0)
 
 
@@ -84,6 +100,7 @@ def parse_args():
     parser.add_argument("--pixdim", type=float, nargs=3, default=[1.5, 1.5, 2.0])
     parser.add_argument("--roi_size", type=int, nargs=3, default=[96, 96, 96])
     parser.add_argument("--num_classes", type=int, default=14)
+    parser.add_argument("--nsd_tol_mm", type=float, default=1.0, help="NSD tolerance in mm")
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=2, help="RandCropByPosNegLabeld num_samples")
@@ -124,28 +141,7 @@ def parse_args():
         default=0,
         help="ignore early-stop counting for first N validations",
     )
-    parser.add_argument(
-        "--pool_keys",
-        type=str,
-        nargs="+",
-        default=["training", "validation"],
-        help="take labeled cases from these json keys and merge as pool (must contain image+label pairs)",
-    )
     parser.add_argument("--train_num", type=int, default=18, help="number of train cases (default 18)")
-    parser.add_argument(
-        "--val_num",
-        type=int,
-        default=12,
-        help="number of validation cases (ONLY used when --val_separate is set). Default 12.",
-    )
-    parser.add_argument("--test_num", type=int, default=12, help="number of test cases (default 12)")
-    parser.add_argument(
-        "--val_separate",
-        action="store_true",
-        help="if set, split into independent val and test sets using val_num/test_num. "
-        "If not set (default), val set will be identical to test set.",
-    )
-    parser.add_argument("--split_seed", type=int, default=123, help="seed for deterministic split shuffling")
     parser.add_argument(
         "--snapshot_extra",
         type=str,
@@ -155,6 +151,8 @@ def parse_args():
     )
 
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--child_run", action="store_true", help="internal flag for multi-seed orchestration")
+    parser.add_argument("--seed_schedule", type=int, nargs="+", default=[123, 1234, 2345], help="seeds to run sequentially when not child_run")
     parser.add_argument("--amp", action="store_true", help="use mixed precision")
     parser.add_argument("--cudnn_benchmark", action="store_true", help="torch.backends.cudnn.benchmark=True")
 
@@ -354,18 +352,18 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
     print(f"[SNAPSHOT] items: {len(copied)} (meta written: snapshot_meta.json)")
 
 
-def build_custom_splits_from_json(
+def build_fixed_splits_from_json(
     json_path: str,
-    pool_keys: List[str],
     train_num: int,
-    val_num: int,
-    test_num: int,
-    split_seed: int,
+    eval_cases: List[Dict[str, str]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     pool: List[Dict[str, Any]] = []
-    for k in pool_keys:
-        part = load_decathlon_datalist(json_path, True, k)
-        pool.extend(part)
+    for k in ["training", "validation"]:
+        try:
+            part = load_decathlon_datalist(json_path, True, k)
+            pool.extend(part)
+        except Exception:
+            continue
 
     uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for d in pool:
@@ -373,29 +371,40 @@ def build_custom_splits_from_json(
         if not key[0] or not key[1]:
             continue
         uniq[key] = d
-    pool = list(uniq.values())
 
-    rng = random.Random(int(split_seed))
-    rng.shuffle(pool)
+    all_cases = list(uniq.values())
 
-    total = len(pool)
-    val_num = max(0, int(val_num))
-    test_num = max(0, int(test_num))
+    def norm_case_key(image_path: str, label_path: str) -> Tuple[str, str]:
+        return (os.path.normpath(image_path).replace("\\", "/"), os.path.normpath(label_path).replace("\\", "/"))
+
+    eval_key_to_case: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for d in all_cases:
+        eval_key_to_case[norm_case_key(d.get("image", ""), d.get("label", ""))] = d
+
+    val_files: List[Dict[str, Any]] = []
+    missing_eval: List[Dict[str, str]] = []
+    for ec in eval_cases:
+        key = norm_case_key(ec["image"], ec["label"])
+        matched = eval_key_to_case.get(key)
+        if matched is None:
+            missing_eval.append(ec)
+        else:
+            val_files.append(matched)
+
+    if missing_eval:
+        miss = json.dumps(missing_eval, ensure_ascii=False)
+        raise RuntimeError(f"Fixed eval cases not found in dataset json: {miss}")
+
+    eval_keys = {norm_case_key(d.get("image", ""), d.get("label", "")) for d in val_files}
+    train_pool = [d for d in all_cases if norm_case_key(d.get("image", ""), d.get("label", "")) not in eval_keys]
+
     train_num = int(train_num)
-
-    if val_num + test_num > total:
-        overflow = val_num + test_num - total
-        test_num = max(0, test_num - overflow)
-
-    remain = total - (val_num + test_num)
     if train_num < 0:
-        train_num = remain
+        train_files = train_pool
     else:
-        train_num = min(train_num, remain)
+        train_files = train_pool[: min(train_num, len(train_pool))]
 
-    val_files = pool[:val_num]
-    test_files = pool[val_num : val_num + test_num]
-    train_files = pool[val_num + test_num : val_num + test_num + train_num]
+    test_files = list(val_files)
     return train_files, val_files, test_files
 
 
@@ -441,6 +450,46 @@ def dice_per_class_onehot(
 
 
 @torch.no_grad()
+def compute_hd95_nsd_per_case(
+    pred_case: torch.Tensor,
+    true_case: torch.Tensor,
+    pixdim: Tuple[float, float, float],
+    fg_classes: int,
+    nsd_tol_mm: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    nsd_thresholds = [float(nsd_tol_mm)] * fg_classes
+    tmp_nsd = SurfaceDiceMetric(
+        class_thresholds=nsd_thresholds,
+        include_background=False,
+        reduction="none",
+        get_not_nans=False,
+        use_subvoxels=True,
+    )
+    tmp_nsd(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+    nsd_case = tmp_nsd.aggregate()
+    tmp_nsd.reset()
+
+    tmp_hd95 = HausdorffDistanceMetric(
+        include_background=False,
+        reduction="none",
+        percentile=95,
+        get_not_nans=False,
+    )
+    tmp_hd95(y_pred=[pred_case], y=[true_case], spacing=pixdim)
+    hd95_case = tmp_hd95.aggregate()
+    tmp_hd95.reset()
+
+    if isinstance(nsd_case, (tuple, list)):
+        nsd_case = nsd_case[0]
+    if isinstance(hd95_case, (tuple, list)):
+        hd95_case = hd95_case[0]
+
+    nsd_case = nsd_case.squeeze(0).detach().cpu().float()
+    hd95_case = hd95_case.squeeze(0).detach().cpu().float()
+    return hd95_case, nsd_case
+
+
+@torch.no_grad()
 def run_evaluation_single_model(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -456,19 +505,19 @@ def run_evaluation_single_model(
     writer: Optional[SummaryWriter] = None,
     prefix: str = "val",
     compute_hd95: bool = False,
+    compute_nsd: bool = False,
+    pixdim: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    nsd_tol_mm: float = 1.0,
 ) -> Dict[str, Any]:
     model.eval()
 
     dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=True)
 
-    hd95_metric = None
-    if compute_hd95:
-        hd95_metric = HausdorffDistanceMetric(
-            include_background=False,
-            reduction="mean_batch",
-            percentile=95,
-            get_not_nans=True,
-        )
+    fg_classes = max(num_classes - 1, 0)
+    sum_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    sum_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
 
     pbar = tqdm(loader, desc=f"{prefix.upper()}@{global_step}", dynamic_ncols=True)
     for batch in pbar:
@@ -491,8 +540,26 @@ def run_evaluation_single_model(
         outputs_convert = [post_pred(x) for x in outputs_list]
 
         dice_metric(y_pred=outputs_convert, y=labels_convert)
-        if hd95_metric is not None:
-            hd95_metric(y_pred=outputs_convert, y=labels_convert)
+
+        if (compute_hd95 or compute_nsd) and fg_classes > 0:
+            for pred_case, true_case in zip(outputs_convert, labels_convert):
+                hd95_case, nsd_case = compute_hd95_nsd_per_case(
+                    pred_case=pred_case,
+                    true_case=true_case,
+                    pixdim=pixdim,
+                    fg_classes=fg_classes,
+                    nsd_tol_mm=nsd_tol_mm,
+                )
+                if compute_hd95:
+                    hd95_case = hd95_case.to(torch.float64)
+                    valid_hd = ~torch.isnan(hd95_case)
+                    sum_hd95 += torch.nan_to_num(hd95_case, nan=0.0)
+                    cnt_hd95 += valid_hd.to(torch.float64)
+                if compute_nsd:
+                    nsd_case = nsd_case.to(torch.float64)
+                    valid_nsd = ~torch.isnan(nsd_case)
+                    sum_nsd += torch.nan_to_num(nsd_case, nan=0.0)
+                    cnt_nsd += valid_nsd.to(torch.float64)
 
     dice_agg = dice_metric.aggregate()
     dice_metric.reset()
@@ -500,23 +567,28 @@ def run_evaluation_single_model(
     dice_per_class = dice_agg[0] if isinstance(dice_agg, (tuple, list)) else dice_agg
     dice_per_class = dice_per_class.detach().float().cpu()
 
-    if hd95_metric is not None:
-        hd_agg = hd95_metric.aggregate()
-        hd95_metric.reset()
-        hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
-        hd95_per_class = hd95_per_class.detach().float().cpu()
-    else:
-        hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float32)
+    hd95_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+    nsd_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+
+    if compute_hd95 and fg_classes > 0:
+        valid_hd = cnt_hd95 > 0
+        hd95_per_class[valid_hd] = (sum_hd95[valid_hd] / cnt_hd95[valid_hd]).float()
+    if compute_nsd and fg_classes > 0:
+        valid_nsd = cnt_nsd > 0
+        nsd_per_class[valid_nsd] = (sum_nsd[valid_nsd] / cnt_nsd[valid_nsd]).float()
 
     dice_mean_incl_bg = float(torch.nanmean(dice_per_class).item())
     dice_mean_fg = float(torch.nanmean(dice_per_class[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
     hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
+    nsd_mean_excl_bg = float(torch.nanmean(nsd_per_class).item()) if nsd_per_class.numel() > 0 else float("nan")
 
     if writer is not None:
         writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
         writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
         if compute_hd95:
             writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        if compute_nsd:
+            writer.add_scalar(f"{prefix}/nsd_mean_excl_bg", nsd_mean_excl_bg, global_step)
 
         for c in range(num_classes):
             writer.add_scalar(
@@ -532,13 +604,22 @@ def run_evaluation_single_model(
                     float(hd95_per_class[idx].item()),
                     global_step,
                 )
+        if compute_nsd:
+            for idx in range(nsd_per_class.numel()):
+                writer.add_scalar(
+                    f"{prefix}/per_class_nsd/{class_names[idx + 1]}",
+                    float(nsd_per_class[idx].item()),
+                    global_step,
+                )
 
     return {
         "dice_mean_incl_bg": dice_mean_incl_bg,
         "dice_mean_fg": dice_mean_fg,
         "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "nsd_mean_excl_bg": nsd_mean_excl_bg,
         "dice_per_class_incl_bg": dice_per_class,
         "hd95_per_class_excl_bg": hd95_per_class,
+        "nsd_per_class_excl_bg": nsd_per_class,
     }
 
 
@@ -559,6 +640,9 @@ def run_test_single_model_and_print_cases(
     writer: Optional[SummaryWriter] = None,
     prefix: str = "test",
     compute_hd95: bool = True,
+    compute_nsd: bool = True,
+    pixdim: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    nsd_tol_mm: float = 1.0,
 ) -> Dict[str, Any]:
     assert os.path.isfile(ckpt_path), f"checkpoint not found: {ckpt_path}"
 
@@ -569,14 +653,11 @@ def run_test_single_model_and_print_cases(
     sum_dice = torch.zeros((num_classes,), dtype=torch.float64)
     cnt_dice = torch.zeros((num_classes,), dtype=torch.float64)
 
-    hd95_metric = None
-    if compute_hd95:
-        hd95_metric = HausdorffDistanceMetric(
-            include_background=False,
-            reduction="mean_batch",
-            percentile=95,
-            get_not_nans=True,
-        )
+    fg_classes = max(num_classes - 1, 0)
+    sum_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_hd95 = torch.zeros((fg_classes,), dtype=torch.float64)
+    sum_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
+    cnt_nsd = torch.zeros((fg_classes,), dtype=torch.float64)
 
     case_rows: List[Dict[str, Any]] = []
 
@@ -609,14 +690,34 @@ def run_test_single_model_and_print_cases(
         sum_dice += torch.nan_to_num(dice_c_cpu, nan=0.0)
         cnt_dice += mask.double()
 
-        if hd95_metric is not None:
-            hd95_metric(y_pred=preds_1hot_list, y=labels_1hot_list)
+        hd95_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+        nsd_case = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+        if (compute_hd95 or compute_nsd) and fg_classes > 0:
+            hd95_case, nsd_case = compute_hd95_nsd_per_case(
+                pred_case=preds_1hot_list[0],
+                true_case=labels_1hot_list[0],
+                pixdim=pixdim,
+                fg_classes=fg_classes,
+                nsd_tol_mm=nsd_tol_mm,
+            )
+            if compute_hd95:
+                hd95_case_f64 = hd95_case.to(torch.float64)
+                valid_hd = ~torch.isnan(hd95_case_f64)
+                sum_hd95 += torch.nan_to_num(hd95_case_f64, nan=0.0)
+                cnt_hd95 += valid_hd.to(torch.float64)
+            if compute_nsd:
+                nsd_case_f64 = nsd_case.to(torch.float64)
+                valid_nsd = ~torch.isnan(nsd_case_f64)
+                sum_nsd += torch.nan_to_num(nsd_case_f64, nan=0.0)
+                cnt_nsd += valid_nsd.to(torch.float64)
 
         case_rows.append(
             {
                 "case_id": case_id,
                 "dice_mean_fg": dice_fg,
                 "dice_per_class_incl_bg": tensor_to_float_list(dice_c.detach().cpu().float()),
+                "hd95_per_class_excl_bg": tensor_to_float_list(hd95_case),
+                "nsd_per_class_excl_bg": tensor_to_float_list(nsd_case),
             }
         )
 
@@ -630,16 +731,17 @@ def run_test_single_model_and_print_cases(
     dice_mean_incl_bg = float(torch.nanmean(dice_per_class_mean_f32).item())
     dice_mean_fg = float(torch.nanmean(dice_per_class_mean_f32[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
 
-    if hd95_metric is not None:
-        hd_agg = hd95_metric.aggregate()
-        hd95_metric.reset()
-        hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
-        hd95_per_class = hd95_per_class.detach().float().cpu()
-        hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
-    else:
-        determine = max(num_classes - 1, 0)
-        hd95_per_class = torch.full((determine,), float("nan"), dtype=torch.float32)
-        hd95_mean_excl_bg = float("nan")
+    hd95_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+    nsd_per_class = torch.full((fg_classes,), float("nan"), dtype=torch.float32)
+    if compute_hd95 and fg_classes > 0:
+        valid_hd = cnt_hd95 > 0
+        hd95_per_class[valid_hd] = (sum_hd95[valid_hd] / cnt_hd95[valid_hd]).float()
+    if compute_nsd and fg_classes > 0:
+        valid_nsd = cnt_nsd > 0
+        nsd_per_class[valid_nsd] = (sum_nsd[valid_nsd] / cnt_nsd[valid_nsd]).float()
+
+    hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
+    nsd_mean_excl_bg = float(torch.nanmean(nsd_per_class).item()) if nsd_per_class.numel() > 0 else float("nan")
 
     case_rows_sorted = sorted(case_rows, key=lambda r: r["dice_mean_fg"])
     dices = np.array([r["dice_mean_fg"] for r in case_rows_sorted], dtype=np.float32)
@@ -664,6 +766,8 @@ def run_test_single_model_and_print_cases(
         writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
         if compute_hd95:
             writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
+        if compute_nsd:
+            writer.add_scalar(f"{prefix}/nsd_mean_excl_bg", nsd_mean_excl_bg, global_step)
 
         for c in range(num_classes):
             writer.add_scalar(
@@ -679,14 +783,23 @@ def run_test_single_model_and_print_cases(
                     float(hd95_per_class[idx].item()),
                     global_step,
                 )
+        if compute_nsd:
+            for idx in range(nsd_per_class.numel()):
+                writer.add_scalar(
+                    f"{prefix}/per_class_nsd/{class_names[idx + 1]}",
+                    float(nsd_per_class[idx].item()),
+                    global_step,
+                )
 
     return {
         "ckpt_path": ckpt_path,
         "dice_mean_incl_bg": dice_mean_incl_bg,
         "dice_mean_fg": dice_mean_fg,
         "hd95_mean_excl_bg": hd95_mean_excl_bg,
+        "nsd_mean_excl_bg": nsd_mean_excl_bg,
         "dice_per_class_incl_bg": dice_per_class_mean_f32,
         "hd95_per_class_excl_bg": hd95_per_class,
+        "nsd_per_class_excl_bg": nsd_per_class,
         "case_rows": case_rows_sorted,
         "case_fg_dice_mean": mean_fg,
         "case_fg_dice_std": std_fg,
@@ -708,6 +821,7 @@ def save_test_results_csv(
 
     dice_pc = test_res["dice_per_class_incl_bg"]
     hd_pc = test_res["hd95_per_class_excl_bg"]
+    nsd_pc = test_res["nsd_per_class_excl_bg"]
     case_rows = test_res["case_rows"]
 
     with open(summary_csv, "w", newline="", encoding="utf-8") as f:
@@ -720,6 +834,7 @@ def save_test_results_csv(
                 "test_dice_mean_fg",
                 "test_dice_mean_incl_bg",
                 "test_hd95_mean_excl_bg",
+                "test_nsd_mean_excl_bg",
                 "case_fg_dice_mean",
                 "case_fg_dice_std",
                 "case_fg_dice_outlier_threshold",
@@ -734,6 +849,7 @@ def save_test_results_csv(
                 "test_dice_mean_fg": safe_float(test_res["dice_mean_fg"]),
                 "test_dice_mean_incl_bg": safe_float(test_res["dice_mean_incl_bg"]),
                 "test_hd95_mean_excl_bg": safe_float(test_res["hd95_mean_excl_bg"]),
+                "test_nsd_mean_excl_bg": safe_float(test_res["nsd_mean_excl_bg"]),
                 "case_fg_dice_mean": safe_float(test_res["case_fg_dice_mean"]),
                 "case_fg_dice_std": safe_float(test_res["case_fg_dice_std"]),
                 "case_fg_dice_outlier_threshold": safe_float(test_res["case_fg_dice_outlier_threshold"]),
@@ -743,28 +859,41 @@ def save_test_results_csv(
     with open(per_class_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["class_index", "class_name", "dice", "hd95"],
+            fieldnames=["class_index", "class_name", "dice", "hd95", "nsd"],
         )
         writer.writeheader()
         for c, class_name in enumerate(class_names):
             dice_val = float(dice_pc[c].item()) if not torch.isnan(dice_pc[c]) else None
             hd95_val = None
+            nsd_val = None
             if c > 0 and (c - 1) < hd_pc.numel():
                 hd_v = hd_pc[c - 1]
                 hd95_val = float(hd_v.item()) if not torch.isnan(hd_v) else None
+            if c > 0 and (c - 1) < nsd_pc.numel():
+                nsd_v = nsd_pc[c - 1]
+                nsd_val = float(nsd_v.item()) if not torch.isnan(nsd_v) else None
             writer.writerow(
                 {
                     "class_index": c,
                     "class_name": class_name,
                     "dice": dice_val,
                     "hd95": hd95_val,
+                    "nsd": nsd_val,
                 }
             )
 
     with open(case_ranking_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["rank_ascending_fg_dice", "case_id", "dice_mean_fg", "is_outlier"],
+            fieldnames=[
+                "rank_ascending_fg_dice",
+                "case_id",
+                "dice_mean_fg",
+                "is_outlier",
+                "dice_per_class_incl_bg",
+                "hd95_per_class_excl_bg",
+                "nsd_per_class_excl_bg",
+            ],
         )
         writer.writeheader()
         for row in case_rows:
@@ -774,6 +903,9 @@ def save_test_results_csv(
                     "case_id": row["case_id"],
                     "dice_mean_fg": safe_float(row["dice_mean_fg"]),
                     "is_outlier": bool(row["is_outlier"]),
+                    "dice_per_class_incl_bg": json.dumps(row.get("dice_per_class_incl_bg", []), ensure_ascii=False),
+                    "hd95_per_class_excl_bg": json.dumps(row.get("hd95_per_class_excl_bg", []), ensure_ascii=False),
+                    "nsd_per_class_excl_bg": json.dumps(row.get("nsd_per_class_excl_bg", []), ensure_ascii=False),
                 }
             )
 
@@ -784,8 +916,7 @@ def save_test_results_csv(
     }
 
 
-def main():
-    args = parse_args()
+def run_single_experiment(args):
 
     run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(args.output_root, f"btcv_run_{run_id}")
@@ -817,30 +948,15 @@ def main():
     num_classes = int(args.num_classes)
     class_names = get_class_names(num_classes)
 
-    if args.val_separate:
-        train_files, val_files, test_files = build_custom_splits_from_json(
-            json_path=json_path,
-            pool_keys=args.pool_keys,
-            train_num=args.train_num,
-            val_num=args.val_num,
-            test_num=args.test_num,
-            split_seed=args.split_seed,
-        )
-        val_source = "separate_val"
-    else:
-        train_files, _empty_val, test_files = build_custom_splits_from_json(
-            json_path=json_path,
-            pool_keys=args.pool_keys,
-            train_num=args.train_num,
-            val_num=0,
-            test_num=args.test_num,
-            split_seed=args.split_seed,
-        )
-        val_files = list(test_files)
-        val_source = "test_as_val"
+    train_files, val_files, test_files = build_fixed_splits_from_json(
+        json_path=json_path,
+        train_num=args.train_num,
+        eval_cases=FIXED_EVAL_CASES,
+    )
+    val_source = "fixed_test_as_val"
 
     print("\n================ SPLIT ================")
-    print(f"[POOL] keys={args.pool_keys} | split_seed={args.split_seed}")
+    print("[POOL] source_keys=['training','validation'] | split_seed=REMOVED")
     print(f"[VAL ] val_source={val_source} | val_start_iter={args.val_start_iter}")
     print(f"[SPLIT] train={len(train_files)} | val={len(val_files)} | test={len(test_files)}")
     print("=======================================\n")
@@ -860,6 +976,7 @@ def main():
             "test_report_metrics": [
                 "test/dice_mean_fg (foreground only, single best.pt)",
                 "test/hd95_mean_excl_bg (foreground only, single best.pt)",
+                "test/nsd_mean_excl_bg (foreground only, single best.pt)",
             ],
             "sw_infer_mode": "gaussian",
             "code_snapshot_dir": os.path.join(output_dir, "snapshot"),
@@ -1145,6 +1262,9 @@ def main():
                     writer=writer,
                     prefix="val",
                     compute_hd95=False,
+                    compute_nsd=False,
+                    pixdim=pixdim,
+                    nsd_tol_mm=args.nsd_tol_mm,
                 )
                 model.train()
                 dice_fg = float(val_res["dice_mean_fg"])
@@ -1224,12 +1344,17 @@ def main():
             writer=writer,
             prefix="test",
             compute_hd95=True,
+            compute_nsd=True,
+            pixdim=pixdim,
+            nsd_tol_mm=args.nsd_tol_mm,
         )
 
         test_dice_fg = float(test_res["dice_mean_fg"])
         test_hd95 = float(test_res["hd95_mean_excl_bg"])
+        test_nsd = float(test_res["nsd_mean_excl_bg"])
         dice_pc = test_res["dice_per_class_incl_bg"]
         hd_pc = test_res["hd95_per_class_excl_bg"]
+        nsd_pc = test_res["nsd_per_class_excl_bg"]
 
         print("\n================ TEST (single best.pt) ================")
         print(f"best_iter                 : {best_step}")
@@ -1237,6 +1362,7 @@ def main():
         print(f"best_path                 : {best_path}")
         print(f"TEST dice_mean_fg         : {test_dice_fg:.6f}")
         print(f"TEST hd95_mean_excl_bg    : {test_hd95:.6f}")
+        print(f"TEST nsd_mean_excl_bg     : {test_nsd:.6f}")
         print("=======================================================\n")
 
         print("Per-class Dice (incl bg, mean-over-cases):")
@@ -1249,6 +1375,13 @@ def main():
             idx = c - 1
             if idx < hd_pc.numel():
                 v = float(hd_pc[idx].item())
+                print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
+
+        print("\nPer-class NSD (excl bg):")
+        for c in range(1, num_classes):
+            idx = c - 1
+            if idx < nsd_pc.numel():
+                v = float(nsd_pc[idx].item())
                 print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
 
         test_csv_paths = save_test_results_csv(
@@ -1280,6 +1413,210 @@ def main():
         print(" -", test_csv_paths["summary_csv"])
         print(" -", test_csv_paths["per_class_csv"])
         print(" -", test_csv_paths["case_ranking_csv"])
+
+
+
+def _nanmean_nanvar(values: List[float]) -> Tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    return float(np.mean(arr)), float(np.var(arr))
+
+
+def aggregate_multi_seed_case_metrics(
+    run_dirs: List[str],
+    class_names: List[str],
+    output_dir: str,
+) -> Dict[str, str]:
+    os.makedirs(output_dir, exist_ok=True)
+
+    fg_class_names = class_names[1:]
+    all_values = {"dice": [], "hd95": [], "nsd": []}
+    per_class_values = {
+        "dice": {i: [] for i in range(len(fg_class_names))},
+        "hd95": {i: [] for i in range(len(fg_class_names))},
+        "nsd": {i: [] for i in range(len(fg_class_names))},
+    }
+
+    for run_dir in run_dirs:
+        case_csv = os.path.join(run_dir, "test_case_ranking.csv")
+        if not os.path.isfile(case_csv):
+            raise RuntimeError(f"missing test_case_ranking.csv for run: {run_dir}")
+
+        with open(case_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                dice_list = json.loads(row.get("dice_per_class_incl_bg", "[]"))
+                hd95_list = json.loads(row.get("hd95_per_class_excl_bg", "[]"))
+                nsd_list = json.loads(row.get("nsd_per_class_excl_bg", "[]"))
+
+                dice_fg = dice_list[1:] if len(dice_list) > 1 else []
+                for i, v in enumerate(dice_fg):
+                    if v is None:
+                        continue
+                    fv = float(v)
+                    all_values["dice"].append(fv)
+                    if i in per_class_values["dice"]:
+                        per_class_values["dice"][i].append(fv)
+
+                for metric_name, values in [("hd95", hd95_list), ("nsd", nsd_list)]:
+                    for i, v in enumerate(values):
+                        if v is None:
+                            continue
+                        fv = float(v)
+                        all_values[metric_name].append(fv)
+                        if i in per_class_values[metric_name]:
+                            per_class_values[metric_name][i].append(fv)
+
+    overall_csv = os.path.join(output_dir, "multi_seed_all_case_organ_stats.csv")
+    with open(overall_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["metric", "mean", "variance"])
+        writer.writeheader()
+        for metric in ["dice", "hd95", "nsd"]:
+            m, v = _nanmean_nanvar(all_values[metric])
+            writer.writerow({"metric": metric, "mean": safe_float(m), "variance": safe_float(v)})
+
+    per_class_csv = os.path.join(output_dir, "multi_seed_per_organ_stats.csv")
+    with open(per_class_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["class_index", "class_name", "dice_mean", "dice_variance", "hd95_mean", "hd95_variance", "nsd_mean", "nsd_variance"],
+        )
+        writer.writeheader()
+        for i, cname in enumerate(fg_class_names, start=1):
+            dm, dv = _nanmean_nanvar(per_class_values["dice"][i - 1])
+            hm, hv = _nanmean_nanvar(per_class_values["hd95"][i - 1])
+            nm, nv = _nanmean_nanvar(per_class_values["nsd"][i - 1])
+            writer.writerow(
+                {
+                    "class_index": i,
+                    "class_name": cname,
+                    "dice_mean": safe_float(dm),
+                    "dice_variance": safe_float(dv),
+                    "hd95_mean": safe_float(hm),
+                    "hd95_variance": safe_float(hv),
+                    "nsd_mean": safe_float(nm),
+                    "nsd_variance": safe_float(nv),
+                }
+            )
+
+    return {"overall_csv": overall_csv, "per_class_csv": per_class_csv}
+
+
+def main():
+    args = parse_args()
+
+    if args.child_run:
+        run_single_experiment(args)
+        return
+
+    schedule = [int(x) for x in args.seed_schedule]
+    if len(schedule) == 0:
+        schedule = [123, 1234, 2345]
+
+    base_run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
+    multi_run_dir = os.path.join(args.output_root, f"btcv_multirun_{base_run_id}")
+    os.makedirs(multi_run_dir, exist_ok=True)
+
+    run_dirs: List[str] = []
+    class_names = get_class_names(int(args.num_classes))
+    script_path = os.path.abspath(__file__)
+
+    print(f"[MULTI-RUN] seeds={schedule}")
+    for seed in schedule:
+        run_name = f"{base_run_id}_seed{seed}"
+        cmd = [
+            sys.executable,
+            script_path,
+            "--child_run",
+            "--seed",
+            str(seed),
+            "--run_name",
+            run_name,
+            "--data_dir",
+            args.data_dir,
+            "--split_json",
+            args.split_json,
+            "--output_root",
+            args.output_root,
+            "--pixdim",
+            str(args.pixdim[0]),
+            str(args.pixdim[1]),
+            str(args.pixdim[2]),
+            "--roi_size",
+            str(args.roi_size[0]),
+            str(args.roi_size[1]),
+            str(args.roi_size[2]),
+            "--num_classes",
+            str(args.num_classes),
+            "--nsd_tol_mm",
+            str(args.nsd_tol_mm),
+            "--batch_size",
+            str(args.batch_size),
+            "--num_samples",
+            str(args.num_samples),
+            "--cache_num_train",
+            str(args.cache_num_train),
+            "--cache_num_val",
+            str(args.cache_num_val),
+            "--cache_num_test",
+            str(args.cache_num_test),
+            "--cache_rate",
+            str(args.cache_rate),
+            "--num_workers_train",
+            str(args.num_workers_train),
+            "--num_workers_val",
+            str(args.num_workers_val),
+            "--num_workers_test",
+            str(args.num_workers_test),
+            "--max_iterations",
+            str(args.max_iterations),
+            "--eval_num",
+            str(args.eval_num),
+            "--val_start_iter",
+            str(args.val_start_iter),
+            "--sw_batch_size",
+            str(args.sw_batch_size),
+            "--sw_overlap",
+            str(args.sw_overlap),
+            "--lr",
+            str(args.lr),
+            "--wd",
+            str(args.wd),
+            "--momentum",
+            str(args.momentum),
+            "--early_stop_patience",
+            str(args.early_stop_patience),
+            "--early_stop_min_delta",
+            str(args.early_stop_min_delta),
+            "--early_stop_warmup",
+            str(args.early_stop_warmup),
+            "--train_num",
+            str(args.train_num),
+        ]
+
+        if args.snapshot_extra:
+            cmd.extend(["--snapshot_extra", *args.snapshot_extra])
+        if args.amp:
+            cmd.append("--amp")
+        if args.cudnn_benchmark:
+            cmd.append("--cudnn_benchmark")
+
+        print(f"[MULTI-RUN] launch seed={seed} -> run_name={run_name}")
+        subprocess.run(cmd, check=True)
+
+        run_dir = os.path.join(args.output_root, f"btcv_run_{run_name}")
+        run_dirs.append(run_dir)
+
+    stats_paths = aggregate_multi_seed_case_metrics(run_dirs=run_dirs, class_names=class_names, output_dir=multi_run_dir)
+    with open(os.path.join(multi_run_dir, "multi_seed_runs.json"), "w", encoding="utf-8") as f:
+        json.dump({"seeds": schedule, "run_dirs": run_dirs, "stats_paths": stats_paths}, f, indent=2)
+
+    print("\n[MULTI-RUN] saved:")
+    print(" -", stats_paths["overall_csv"])
+    print(" -", stats_paths["per_class_csv"])
+    print(" -", os.path.join(multi_run_dir, "multi_seed_runs.json"))
 
 
 if __name__ == "__main__":

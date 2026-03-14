@@ -32,9 +32,87 @@ def _ensure_monai_trunc_normal() -> None:
 
 def build_model() -> torch.nn.Module:
     _ensure_monai_trunc_normal()
+    _patch_wavelet_device_behavior()
     from WaveFFTVNet.networks.model1 import VNet
 
     return VNet(n_channels=1, n_classes=14, n_filters=16, has_residual=False)
+
+
+def _patch_wavelet_device_behavior() -> None:
+    """Patch DWT/IDWT so wavelet matrices follow the current input tensor device.
+
+    Some implementations create matrices on CUDA whenever CUDA is available,
+    which can mismatch when the actual tensors are on CPU (or vice versa).
+    """
+    from WaveFFTVNet.networks import DWT_IDWT_layer as dwt_layer
+    from WaveFFTVNet.networks.DWT_IDWT_layer import DWTFunction_3D, IDWTFunction_3D
+
+    if getattr(dwt_layer.DWT_3D, "_device_patched_for_param", False):
+        return
+
+    def _dwt_forward(self, input_tensor):
+        assert len(input_tensor.size()) == 5
+        self.input_depth = input_tensor.size()[-3]
+        self.input_height = input_tensor.size()[-2]
+        self.input_width = input_tensor.size()[-1]
+        self.get_matrix()
+
+        target_device = input_tensor.device
+        target_dtype = input_tensor.dtype
+        self.matrix_low_0 = self.matrix_low_0.to(device=target_device, dtype=target_dtype)
+        self.matrix_low_1 = self.matrix_low_1.to(device=target_device, dtype=target_dtype)
+        self.matrix_low_2 = self.matrix_low_2.to(device=target_device, dtype=target_dtype)
+        self.matrix_high_0 = self.matrix_high_0.to(device=target_device, dtype=target_dtype)
+        self.matrix_high_1 = self.matrix_high_1.to(device=target_device, dtype=target_dtype)
+        self.matrix_high_2 = self.matrix_high_2.to(device=target_device, dtype=target_dtype)
+
+        return DWTFunction_3D.apply(
+            input_tensor,
+            self.matrix_low_0,
+            self.matrix_low_1,
+            self.matrix_low_2,
+            self.matrix_high_0,
+            self.matrix_high_1,
+            self.matrix_high_2,
+        )
+
+    def _idwt_forward(self, LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH):
+        assert len(LLL.size()) == len(LLH.size()) == len(LHL.size()) == len(LHH.size()) == 5
+        assert len(HLL.size()) == len(HLH.size()) == len(HHL.size()) == len(HHH.size()) == 5
+        self.input_depth = LLL.size()[-3] + HHH.size()[-3]
+        self.input_height = LLL.size()[-2] + HHH.size()[-2]
+        self.input_width = LLL.size()[-1] + HHH.size()[-1]
+        self.get_matrix()
+
+        target_device = LLL.device
+        target_dtype = LLL.dtype
+        self.matrix_low_0 = self.matrix_low_0.to(device=target_device, dtype=target_dtype)
+        self.matrix_low_1 = self.matrix_low_1.to(device=target_device, dtype=target_dtype)
+        self.matrix_low_2 = self.matrix_low_2.to(device=target_device, dtype=target_dtype)
+        self.matrix_high_0 = self.matrix_high_0.to(device=target_device, dtype=target_dtype)
+        self.matrix_high_1 = self.matrix_high_1.to(device=target_device, dtype=target_dtype)
+        self.matrix_high_2 = self.matrix_high_2.to(device=target_device, dtype=target_dtype)
+
+        return IDWTFunction_3D.apply(
+            LLL,
+            LLH,
+            LHL,
+            LHH,
+            HLL,
+            HLH,
+            HHL,
+            HHH,
+            self.matrix_low_0,
+            self.matrix_low_1,
+            self.matrix_low_2,
+            self.matrix_high_0,
+            self.matrix_high_1,
+            self.matrix_high_2,
+        )
+
+    dwt_layer.DWT_3D.forward = _dwt_forward
+    dwt_layer.IDWT_3D.forward = _idwt_forward
+    dwt_layer.DWT_3D._device_patched_for_param = True
 
 
 def count_params(model: torch.nn.Module) -> int:

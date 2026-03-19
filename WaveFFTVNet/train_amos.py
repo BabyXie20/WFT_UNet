@@ -104,7 +104,7 @@ def parse_args():
     # train/val schedule (iteration-based)
     parser.add_argument("--max_iterations", type=int, default=40000)
     parser.add_argument("--eval_num", type=int, default=400)
-    parser.add_argument("--val_start_iter", type=int, default=11000, help="start val eval at this iter (inclusive)")
+    parser.add_argument("--val_start_iter", type=int, default=10000, help="start val eval at this iter (inclusive)")
     parser.add_argument("--sw_batch_size", type=int, default=2)
     parser.add_argument("--sw_overlap", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=3, help="keep top-k checkpoints by val foreground Dice")
@@ -115,10 +115,10 @@ def parse_args():
         help="save periodic checkpoint every N iterations; <=0 disables it",
     )
     parser.add_argument(
-        "--resume",
-        type=str,
-        default="",
-        help="path to a full training checkpoint for resuming",
+    "--resume",
+    type=str,
+    default="",
+    help="path to a full training checkpoint for resuming",
     )
     # optim
     parser.add_argument("--lr", type=float, default=0.01)
@@ -133,7 +133,7 @@ def parse_args():
     parser.add_argument(
         "--early_stop_patience",
         type=int,
-        default=11,
+        default=10,
         help="stop after N validations without improvement (monitor: val foreground Dice)",
     )
     parser.add_argument(
@@ -422,10 +422,10 @@ def _match_excluded_case(d: Dict[str, Any], excluded_set: set) -> bool:
             return True
     return False
 
-
 def _replace_dir_token(path_str: str, old_token: str, new_token: str) -> str:
     if not path_str:
         return path_str
+    # 兼容 Linux / Windows 路径分隔符
     pattern = rf'([/\\\\]){re.escape(old_token)}([/\\\\])'
     return re.sub(pattern, rf"\1{new_token}\2", path_str, count=1)
 
@@ -440,12 +440,14 @@ def _fix_single_pair_paths(d: Dict[str, Any], split_name: str = "test") -> Dict[
     img = str(out.get("image", "") or "")
     lab = str(out.get("label", "") or "")
 
+    # image: imagesTs -> imagesTr
     if img and (not os.path.exists(img)):
         cand = _replace_dir_token(img, "imagesTs", "imagesTr")
         if cand != img and os.path.exists(cand):
             print(f"[PATH_FIX][{split_name}] image: {img}  -->  {cand}")
             img = cand
 
+    # label: labelsTs -> labelsTr
     if lab and (not os.path.exists(lab)):
         cand = _replace_dir_token(lab, "labelsTs", "labelsTr")
         if cand != lab and os.path.exists(cand):
@@ -473,6 +475,7 @@ def _fix_split_pair_paths(files: List[Dict[str, Any]], split_name: str) -> List[
     if changed > 0:
         print(f"[PATH_FIX][{split_name}] changed {changed}/{len(files)} entries")
 
+    # 提前检查，避免到 CacheDataset / LoadImaged 才报错
     missing: List[Tuple[int, str, str]] = []
     for i, d in enumerate(fixed):
         for k in ("image", "label"):
@@ -493,103 +496,6 @@ def _fix_split_pair_paths(files: List[Dict[str, Any]], split_name: str) -> List[
     return fixed
 
 
-# ----------------------------
-# stable case_id helpers
-# ----------------------------
-def _strip_known_extensions(name: str) -> str:
-    name = os.path.basename(str(name))
-    low = name.lower()
-    if low.endswith(".nii.gz"):
-        return name[:-7]
-    stem, _ = os.path.splitext(name)
-    return stem
-
-
-def _derive_case_id_from_entry(d: Dict[str, Any]) -> str:
-    """
-    稳定生成 case_id，优先级：
-    1) 样本字典里已有 case_id，则直接用
-    2) 从 image / label 文件名中提取共同数字 id（优先 4 位）
-    3) 从 image 文件名提取数字 id
-    4) 从 label 文件名提取数字 id
-    5) 退化为 image basename（去后缀）
-    """
-    explicit = str(d.get("case_id", "") or "").strip()
-    if explicit:
-        return explicit
-
-    img_path = str(d.get("image", "") or "")
-    lab_path = str(d.get("label", "") or "")
-
-    img_base = _strip_known_extensions(img_path)
-    lab_base = _strip_known_extensions(lab_path)
-
-    img_ids = _extract_case_ids_from_basename(img_base)
-    lab_ids = _extract_case_ids_from_basename(lab_base)
-
-    if img_ids and lab_ids:
-        lab_set = set(lab_ids)
-        for cid in img_ids:
-            if cid in lab_set:
-                return cid
-
-    if img_ids:
-        return img_ids[0]
-    if lab_ids:
-        return lab_ids[0]
-
-    if img_base:
-        return img_base
-    if lab_base:
-        return lab_base
-
-    return "unknown_case"
-
-
-def attach_case_ids(files: List[Dict[str, Any]], split_name: str) -> List[Dict[str, Any]]:
-    """
-    给每个样本显式写入 case_id。
-    这样后续不依赖 MONAI metadata，也能稳定拿到真实 case_id。
-    """
-    out: List[Dict[str, Any]] = []
-    seen: Dict[str, int] = {}
-
-    for d in files:
-        nd = dict(d)
-        cid = _derive_case_id_from_entry(nd)
-        nd["case_id"] = cid
-        out.append(nd)
-        seen[cid] = seen.get(cid, 0) + 1
-
-    dup_ids = [cid for cid, cnt in seen.items() if cnt > 1]
-    if dup_ids:
-        print(
-            f"[CASE_ID][{split_name}][WARN] duplicated case_id detected: "
-            f"{dup_ids[:10]}{' ...' if len(dup_ids) > 10 else ''}"
-        )
-
-    print(f"[CASE_ID][{split_name}] attached case_id for {len(out)} samples")
-    return out
-
-
-def _unwrap_singleton(x: Any) -> Any:
-    """
-    从 DataLoader collate 后的 list/tuple/numpy object 中取出单个值。
-    主要用于 batch_size=1 的 val/test。
-    """
-    while isinstance(x, (list, tuple)):
-        if len(x) == 0:
-            return None
-        x = x[0]
-
-    if isinstance(x, np.ndarray):
-        if x.size == 0:
-            return None
-        x = x.reshape(-1)[0]
-
-    return x
-
-
 def build_custom_splits_from_json(
     json_path: str,
     pool_keys: List[str],
@@ -604,6 +510,7 @@ def build_custom_splits_from_json(
         part = load_decathlon_datalist(json_path, True, k)
         pool.extend(part)
 
+    # de-dup
     uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for d in pool:
         key = (d.get("image", ""), d.get("label", ""))
@@ -612,6 +519,7 @@ def build_custom_splits_from_json(
         uniq[key] = d
     pool = list(uniq.values())
 
+    # exclude specified cases before splitting
     excluded_set = set()
     if exclude_cases:
         excluded_set = {_normalize_case_id(x) for x in exclude_cases}
@@ -647,37 +555,13 @@ def build_custom_splits_from_json(
 
 
 def _get_case_id(batch: Dict[str, Any]) -> str:
-    # 1) 最优先：直接读取我们显式注入的 case_id
-    try:
-        cid = _unwrap_singleton(batch.get("case_id", None))
-        if cid is not None:
-            cid = str(cid).strip()
-            if cid:
-                return cid
-    except Exception:
-        pass
-
-    # 2) 兼容旧式 image_meta_dict
     try:
         md = batch.get("image_meta_dict", None)
-        if isinstance(md, dict) and ("filename_or_obj" in md):
-            fn = _unwrap_singleton(md["filename_or_obj"])
-            if fn is not None:
-                return _derive_case_id_from_entry({"image": str(fn)})
+        if md and "filename_or_obj" in md:
+            fn = md["filename_or_obj"][0]
+            return str(fn)
     except Exception:
         pass
-
-    # 3) 兼容 MetaTensor.meta
-    try:
-        img = batch.get("image", None)
-        if hasattr(img, "meta") and isinstance(img.meta, dict):
-            fn = img.meta.get("filename_or_obj", None)
-            fn = _unwrap_singleton(fn)
-            if fn is not None:
-                return _derive_case_id_from_entry({"image": str(fn)})
-    except Exception:
-        pass
-
     return "unknown_case"
 
 
@@ -769,13 +653,13 @@ def run_evaluation_single_model(
     dice_metric.reset()
 
     dice_per_class = dice_agg[0] if isinstance(dice_agg, (tuple, list)) else dice_agg
-    dice_per_class = dice_per_class.detach().float().cpu()
+    dice_per_class = dice_per_class.detach().float().cpu()  # [C]
 
     if hd95_metric is not None:
         hd_agg = hd95_metric.aggregate()
         hd95_metric.reset()
         hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
-        hd95_per_class = hd95_per_class.detach().float().cpu()
+        hd95_per_class = hd95_per_class.detach().float().cpu()  # [C-1]
     else:
         hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float32)
 
@@ -1054,7 +938,7 @@ def main():
             json_path=json_path,
             pool_keys=args.pool_keys,
             train_num=args.train_num,
-            val_num=0,
+            val_num=0,  # critical
             test_num=args.test_num,
             split_seed=args.split_seed,
             exclude_cases=args.exclude_cases,
@@ -1068,21 +952,8 @@ def main():
     print(f"[VAL ] val_source={val_source} | val_start_iter={args.val_start_iter}")
     print(f"[SPLIT] train={len(train_files)} | val={len(val_files)} | test={len(test_files)}")
     print("=======================================\n")
-
-    # 路径修正
-    train_files = _fix_split_pair_paths(train_files, split_name="train")
     val_files = _fix_split_pair_paths(val_files, split_name="val")
     test_files = _fix_split_pair_paths(test_files, split_name="test")
-
-    # 显式注入稳定 case_id，不再依赖 MONAI metadata
-    train_files = attach_case_ids(train_files, split_name="train")
-    val_files = attach_case_ids(val_files, split_name="val")
-    test_files = attach_case_ids(test_files, split_name="test")
-
-    print("[CASE_ID][train] preview:", [d["case_id"] for d in train_files[:5]])
-    print("[CASE_ID][val]   preview:", [d["case_id"] for d in val_files[:5]])
-    print("[CASE_ID][test]  preview:", [d["case_id"] for d in test_files[:5]])
-
     # write config.json
     cfg = vars(args).copy()
     cfg.update(
@@ -1169,13 +1040,11 @@ def main():
                 prob=0.50,
             ),
             RandAffined(
-                keys=["image", "label"],
-                mode=("bilinear", "nearest"),
-                prob=1.0,
-                spatial_size=(96, 96, 96),
+                keys=['image', 'label'],
+                mode=('bilinear', 'nearest'),
+                prob=1.0, spatial_size=(96, 96, 96),
                 rotate_range=(0, 0, np.pi / 30),
-                scale_range=(0.1, 0.1, 0.1),
-            ),
+                scale_range=(0.1, 0.1, 0.1)),
             RandGaussianNoised(keys=["image"], std=0.01, prob=0.15),
         ]
     )
@@ -1245,7 +1114,7 @@ def main():
     )
 
     # ----------------------------
-    # val/test dataset/loader are lazy-built
+    # NEW: val/test dataset/loader are lazy-built
     # ----------------------------
     val_ds = None
     val_loader = None
@@ -1259,7 +1128,7 @@ def main():
         nonlocal val_ds, val_loader
         if val_loader is not None:
             return val_loader
-
+        # build val cache only when needed
         val_ds = CacheDataset(
             data=val_files,
             transform=eval_transforms,
@@ -1285,6 +1154,7 @@ def main():
         if test_loader is not None:
             return test_loader
 
+        # if val=test and val_loader already exists and settings match, reuse it
         if (
             (val_source == "test_as_val")
             and (val_loader is not None)
@@ -1296,6 +1166,7 @@ def main():
             print("[TEST] reuse val_loader as test_loader (val=test)")
             return test_loader
 
+        # otherwise build test loader lazily
         test_ds = CacheDataset(
             data=test_files,
             transform=eval_transforms,
@@ -1334,21 +1205,26 @@ def main():
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
+    # --- param groups: decay vs no_decay (bias/norm excluded) ---
     param_groups = build_param_groups(model, weight_decay=float(args.wd))
 
+    # --- SGD (scheme B): weight_decay is controlled per param_group ---
     optimizer = torch.optim.SGD(
         param_groups,
         lr=float(args.lr),
         momentum=float(args.momentum),
     )
 
+    # PolyLR scheduler (iteration-based)
     scheduler = None
     if args.use_poly:
         base_lr = float(args.lr)
 
         def lr_lambda(step: int):
+            # step: 0,1,2,... (per optimizer update)
             t = min(max(step, 0), int(args.max_iterations))
             poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
+            # clamp to min_lr
             return max(float(args.min_lr) / base_lr, poly)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -1362,7 +1238,7 @@ def main():
     topk = max(1, int(args.topk))
     topk_dir = os.path.join(output_dir, f"top{topk}")
     os.makedirs(topk_dir, exist_ok=True)
-    topk_list: List[Tuple[float, int, str]] = []
+    topk_list: List[Tuple[float, int, str]] = []  # (dice_fg, step, path)
 
     periodic_ckpt_dir = os.path.join(output_dir, "periodic_checkpoints")
     os.makedirs(periodic_ckpt_dir, exist_ok=True)
@@ -1380,6 +1256,7 @@ def main():
     stop_training = False
     early_stop_reason = ""
 
+
     def maybe_update_topk(dice_fg: float, step: int) -> None:
         nonlocal topk_list
         qualifies = (len(topk_list) < topk) or (dice_fg > topk_list[-1][0])
@@ -1387,6 +1264,7 @@ def main():
             return
 
         ckpt_path = os.path.join(topk_dir, f"iter{step:06d}_dice{dice_fg:.6f}.pt")
+        # 保持为 model-only，保证现有 test ensemble 逻辑兼容
         torch.save(model.state_dict(), ckpt_path)
 
         topk_list.append((float(dice_fg), int(step), ckpt_path))
@@ -1407,6 +1285,7 @@ def main():
                 f,
                 indent=2,
             )
+
 
     def _build_full_training_checkpoint(step: int) -> Dict[str, Any]:
         ckpt = {
@@ -1433,13 +1312,17 @@ def main():
         }
         return ckpt
 
+
     def save_periodic_checkpoint(step: int) -> None:
+        # 1) 保存带 iter 编号的完整恢复点
         ckpt_path = os.path.join(periodic_ckpt_dir, f"iter{step:06d}.pt")
         torch.save(_build_full_training_checkpoint(step), ckpt_path)
         print(f"[SAVE] periodic full checkpoint @ iter={step} -> {ckpt_path}")
 
+        # 2) 同时覆盖保存一个“最近恢复点”
         torch.save(_build_full_training_checkpoint(step), last_resume_path)
         print(f"[SAVE] last resume checkpoint updated -> {last_resume_path}")
+
 
     def try_resume_from_checkpoint(resume_path: str) -> None:
         nonlocal global_step, best_val_dice_fg, best_step
@@ -1485,6 +1368,7 @@ def main():
             if isinstance(item, (list, tuple)) and len(item) == 3:
                 s, it, p = item
                 p = str(p)
+                # 只保留当前仍存在的 topk 文件
                 if os.path.isfile(p):
                     restored_topk.append((float(s), int(it), p))
         restored_topk.sort(key=lambda x: x[0], reverse=True)
@@ -1511,14 +1395,16 @@ def main():
             f"num_evals={num_evals} | bad_evals={bad_evals} | topk_kept={len(topk_list)}"
         )
 
+
+    # 如果指定 --resume，则恢复训练状态
     if args.resume.strip():
         try_resume_from_checkpoint(args.resume.strip())
 
     pbar = tqdm(
-        total=args.max_iterations,
-        initial=global_step,
-        desc="Training",
-        dynamic_ncols=True,
+    total=args.max_iterations,
+    initial=global_step,
+    desc="Training",
+    dynamic_ncols=True,
     )
     t0 = time.time()
 
@@ -1534,9 +1420,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type=device.type, enabled=use_amp):
+                # 深监督已移除：模型只返回主输出 logits
                 logits = model(x)
                 loss = loss_function(logits, y)
 
+            # 只记录主损失（保留你的loss_total命名，避免TensorBoard曲线断档）
             writer.add_scalar("train/loss_total", float(loss.item()), global_step)
 
             scaler.scale(loss).backward()
@@ -1609,6 +1497,7 @@ def main():
                         f"| val_dice_incl_bg={dice_incl_bg:.4f}"
                     )
 
+                # early stop logic
                 num_evals += 1
                 improved_for_early_stop = (dice_fg > (prev_best + args.early_stop_min_delta))
                 if improved_for_early_stop:
@@ -1639,7 +1528,6 @@ def main():
         print(f"Stopped early at iter={global_step}. Reason: {early_stop_reason}")
         torch.save(_build_full_training_checkpoint(global_step), last_resume_path)
         print(f"[SAVE] final last resume checkpoint -> {last_resume_path}")
-
     test_metrics: Dict[str, Any] = {}
 
     ckpt_paths = [p for (_, _, p) in topk_list if os.path.isfile(p)]
@@ -1752,4 +1640,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()  

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import csv
 import time
 import math
 import argparse
@@ -77,19 +78,19 @@ def parse_args():
         "MONAI AMOS - Iteration Training + TensorBoard + custom split; "
     )
 
-    # paths
+           
     parser.add_argument("--data_dir", type=str, default="../data2/amos")
     parser.add_argument("--split_json", type=str, default="dataset_0.json")
 
     parser.add_argument("--output_root", type=str, default="./outputs")
     parser.add_argument("--run_name", type=str, default="", help="optional, if empty use timestamp")
 
-    # preprocessing
+                   
     parser.add_argument("--pixdim", type=float, nargs=3, default=[1.5, 1.5, 2.0])
     parser.add_argument("--roi_size", type=int, nargs=3, default=[96, 96, 96])
     parser.add_argument("--num_classes", type=int, default=16)
 
-    # dataset/cache
+                   
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=2, help="RandCropByPosNegLabeld num_samples")
     parser.add_argument("--cache_num_train", type=int, default=160, help="<=0 means cache all")
@@ -101,13 +102,12 @@ def parse_args():
     parser.add_argument("--num_workers_val", type=int, default=6)
     parser.add_argument("--num_workers_test", type=int, default=6)
 
-    # train/val schedule (iteration-based)
+                                          
     parser.add_argument("--max_iterations", type=int, default=40000)
     parser.add_argument("--eval_num", type=int, default=400)
     parser.add_argument("--val_start_iter", type=int, default=10000, help="start val eval at this iter (inclusive)")
     parser.add_argument("--sw_batch_size", type=int, default=2)
     parser.add_argument("--sw_overlap", type=float, default=0.5)
-    parser.add_argument("--topk", type=int, default=3, help="keep top-k checkpoints by val foreground Dice")
     parser.add_argument(
         "--save_ckpt_every",
         type=int,
@@ -120,12 +120,12 @@ def parse_args():
     default="",
     help="path to a full training checkpoint for resuming",
     )
-    # optim
+           
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
 
-    # PolyLR (per-iteration)
+                            
     parser.add_argument("--use_poly", action="store_true", help="use PolyLR per-iteration")
     parser.add_argument("--poly_power", type=float, default=0.9)
     parser.add_argument("--min_lr", type=float, default=1e-6)
@@ -302,7 +302,7 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
 
     copied: List[Dict[str, Any]] = []
 
-    # 1) Save main script
+                         
     if script_path and os.path.isfile(script_path):
         dst = os.path.join(snapshot_dir, os.path.basename(script_path))
         shutil.copy2(script_path, dst)
@@ -319,7 +319,7 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
         except Exception as e:
             print(f"[SNAPSHOT][WARN] cannot save script source: {type(e).__name__}: {e}")
 
-    # 2) Save extra paths
+                         
     extra_rel_paths = extra_rel_paths or []
     for rel in extra_rel_paths:
         if not rel:
@@ -344,7 +344,7 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
         except Exception as e:
             print(f"[SNAPSHOT][WARN] failed copying {src} -> {dst}: {type(e).__name__}: {e}")
 
-    # 3) Git info (optional)
+                            
     git_commit = ""
     git_dirty = None
     git_root = None
@@ -380,7 +380,7 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
     }
 
     try:
-        import monai  # noqa: F401
+        import monai              
         meta["packages"]["monai"] = getattr(monai, "__version__", "")
     except Exception:
         meta["packages"]["monai"] = ""
@@ -392,9 +392,9 @@ def save_code_snapshot(output_dir: str, extra_rel_paths: Optional[List[str]] = N
     print(f"[SNAPSHOT] items: {len(copied)} (meta written: snapshot_meta.json)")
 
 
-# ----------------------------
-# helpers for excluding cases before split
-# ----------------------------
+                              
+                                          
+                              
 def _normalize_case_id(cid: str) -> str:
     cid = str(cid).strip()
     if cid.isdigit():
@@ -425,7 +425,7 @@ def _match_excluded_case(d: Dict[str, Any], excluded_set: set) -> bool:
 def _replace_dir_token(path_str: str, old_token: str, new_token: str) -> str:
     if not path_str:
         return path_str
-    # 兼容 Linux / Windows 路径分隔符
+                              
     pattern = rf'([/\\\\]){re.escape(old_token)}([/\\\\])'
     return re.sub(pattern, rf"\1{new_token}\2", path_str, count=1)
 
@@ -440,14 +440,14 @@ def _fix_single_pair_paths(d: Dict[str, Any], split_name: str = "test") -> Dict[
     img = str(out.get("image", "") or "")
     lab = str(out.get("label", "") or "")
 
-    # image: imagesTs -> imagesTr
+                                 
     if img and (not os.path.exists(img)):
         cand = _replace_dir_token(img, "imagesTs", "imagesTr")
         if cand != img and os.path.exists(cand):
             print(f"[PATH_FIX][{split_name}] image: {img}  -->  {cand}")
             img = cand
 
-    # label: labelsTs -> labelsTr
+                                 
     if lab and (not os.path.exists(lab)):
         cand = _replace_dir_token(lab, "labelsTs", "labelsTr")
         if cand != lab and os.path.exists(cand):
@@ -475,7 +475,7 @@ def _fix_split_pair_paths(files: List[Dict[str, Any]], split_name: str) -> List[
     if changed > 0:
         print(f"[PATH_FIX][{split_name}] changed {changed}/{len(files)} entries")
 
-    # 提前检查，避免到 CacheDataset / LoadImaged 才报错
+                                            
     missing: List[Tuple[int, str, str]] = []
     for i, d in enumerate(fixed):
         for k in ("image", "label"):
@@ -510,7 +510,7 @@ def build_custom_splits_from_json(
         part = load_decathlon_datalist(json_path, True, k)
         pool.extend(part)
 
-    # de-dup
+            
     uniq: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for d in pool:
         key = (d.get("image", ""), d.get("label", ""))
@@ -519,7 +519,7 @@ def build_custom_splits_from_json(
         uniq[key] = d
     pool = list(uniq.values())
 
-    # exclude specified cases before splitting
+                                              
     excluded_set = set()
     if exclude_cases:
         excluded_set = {_normalize_case_id(x) for x in exclude_cases}
@@ -554,15 +554,66 @@ def build_custom_splits_from_json(
     return train_files, val_files, test_files
 
 
-def _get_case_id(batch: Dict[str, Any]) -> str:
-    try:
-        md = batch.get("image_meta_dict", None)
-        if md and "filename_or_obj" in md:
-            fn = md["filename_or_obj"][0]
-            return str(fn)
-    except Exception:
-        pass
-    return "unknown_case"
+def _extract_case_number_from_text(text: str) -> str:
+    matches = _extract_case_ids_from_basename(os.path.basename(str(text)))
+    if matches:
+        return matches[0]
+    return ""
+
+
+def _get_batch_meta_value(batch: Dict[str, Any], key: str) -> Any:
+    meta = batch.get("image_meta_dict", None)
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        return meta.get(key)
+    return None
+
+
+def _first_meta_item(value: Any) -> Any:
+    if isinstance(value, (list, tuple)) and len(value) > 0:
+        return value[0]
+    return value
+
+
+def _get_case_info(batch: Dict[str, Any], fallback_case_id: str = "") -> Tuple[str, str]:
+    candidates: List[str] = []
+    image_path = _first_meta_item(_get_batch_meta_value(batch, "filename_or_obj"))
+    if image_path:
+        candidates.append(str(image_path))
+    filename = _first_meta_item(_get_batch_meta_value(batch, "filename_or_obj"))
+    if filename:
+        candidates.append(str(filename))
+    for key in ("image", "label"):
+        value = batch.get(key, None)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, (list, tuple)) and value and isinstance(value[0], str):
+            candidates.append(value[0])
+    if fallback_case_id:
+        candidates.append(fallback_case_id)
+    for candidate in candidates:
+        case_number = _extract_case_number_from_text(candidate)
+        if case_number:
+            return str(candidate), case_number
+    if fallback_case_id:
+        return fallback_case_id, _extract_case_number_from_text(fallback_case_id)
+    return "unknown_case", ""
+
+
+def _get_spacing_for_batch(batch: Dict[str, Any], batch_size: int, default_spacing: Tuple[float, float, float]) -> List[Tuple[float, float, float]]:
+    spacing_value = _first_meta_item(_get_batch_meta_value(batch, "pixdim"))
+    if spacing_value is None:
+        spacing = tuple(float(x) for x in default_spacing)
+    else:
+        spacing_array = np.asarray(spacing_value, dtype=np.float32).reshape(-1)
+        if spacing_array.size >= 4:
+            spacing = tuple(float(x) for x in spacing_array[1:4])
+        elif spacing_array.size >= 3:
+            spacing = tuple(float(x) for x in spacing_array[:3])
+        else:
+            spacing = tuple(float(x) for x in default_spacing)
+    return [spacing for _ in range(batch_size)]
 
 
 def dice_per_class_onehot(
@@ -595,6 +646,44 @@ def dice_per_class_onehot(
     return dice
 
 
+def iou_per_class_onehot(
+    y_pred_1hot: torch.Tensor,
+    y_true_1hot: torch.Tensor,
+    eps: float = 1e-8,
+    ignore_empty: bool = True,
+) -> torch.Tensor:
+    if y_pred_1hot.dim() == 5:
+        y_pred_1hot = y_pred_1hot[0]
+    if y_true_1hot.dim() == 5:
+        y_true_1hot = y_true_1hot[0]
+
+    y_pred = y_pred_1hot.float()
+    y_true = y_true_1hot.float()
+
+    dims = tuple(range(1, y_pred.dim()))
+    inter = (y_pred * y_true).sum(dim=dims)
+    pred_sum = y_pred.sum(dim=dims)
+    true_sum = y_true.sum(dim=dims)
+    union = pred_sum + true_sum - inter
+
+    iou = inter / (union + eps)
+
+    if ignore_empty:
+        nan = torch.tensor(float("nan"), device=iou.device, dtype=iou.dtype)
+        iou = torch.where(true_sum > 0, iou, nan)
+    else:
+        iou = torch.where(union > 0, iou, torch.ones_like(iou))
+    return iou
+
+
+def write_dict_rows_to_csv(csv_path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
 @torch.no_grad()
 def run_evaluation_single_model(
     model: torch.nn.Module,
@@ -611,11 +700,10 @@ def run_evaluation_single_model(
     writer: Optional[SummaryWriter] = None,
     prefix: str = "val",
     compute_hd95: bool = False,
+    default_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Dict[str, Any]:
     model.eval()
-
     dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=True)
-
     hd95_metric = None
     if compute_hd95:
         hd95_metric = HausdorffDistanceMetric(
@@ -624,12 +712,12 @@ def run_evaluation_single_model(
             percentile=95,
             get_not_nans=True,
         )
-
+    sum_iou = torch.zeros((num_classes,), dtype=torch.float64)
+    cnt_iou = torch.zeros((num_classes,), dtype=torch.float64)
     pbar = tqdm(loader, desc=f"{prefix.upper()}@{global_step}", dynamic_ncols=True)
     for batch in pbar:
         inputs = batch["image"].to(device)
         labels = batch["label"].to(device)
-
         outputs = sliding_window_inference(
             inputs,
             roi_size=roi_size,
@@ -638,61 +726,60 @@ def run_evaluation_single_model(
             overlap=sw_overlap,
             mode="gaussian",
         )
-
         labels_list = decollate_batch(labels)
         labels_convert = [post_label(x) for x in labels_list]
-
         outputs_list = decollate_batch(outputs)
         outputs_convert = [post_pred(x) for x in outputs_list]
-
         dice_metric(y_pred=outputs_convert, y=labels_convert)
+        iou_c = iou_per_class_onehot(outputs_convert[0], labels_convert[0], ignore_empty=True)
+        iou_c_cpu = iou_c.detach().cpu().double()
+        mask = ~torch.isnan(iou_c_cpu)
+        sum_iou += torch.nan_to_num(iou_c_cpu, nan=0.0)
+        cnt_iou += mask.double()
         if hd95_metric is not None:
-            hd95_metric(y_pred=outputs_convert, y=labels_convert)
-
+            spacing = _get_spacing_for_batch(batch, len(outputs_convert), default_spacing)
+            hd95_metric(y_pred=outputs_convert, y=labels_convert, spacing=spacing)
     dice_agg = dice_metric.aggregate()
     dice_metric.reset()
-
     dice_per_class = dice_agg[0] if isinstance(dice_agg, (tuple, list)) else dice_agg
-    dice_per_class = dice_per_class.detach().float().cpu()  # [C]
-
+    dice_per_class = dice_per_class.detach().float().cpu()
+    iou_per_class = torch.full((num_classes,), float("nan"), dtype=torch.float64)
+    valid_iou = cnt_iou > 0
+    iou_per_class[valid_iou] = sum_iou[valid_iou] / cnt_iou[valid_iou]
+    iou_per_class = iou_per_class.float()
     if hd95_metric is not None:
         hd_agg = hd95_metric.aggregate()
         hd95_metric.reset()
         hd95_per_class = hd_agg[0] if isinstance(hd_agg, (tuple, list)) else hd_agg
-        hd95_per_class = hd95_per_class.detach().float().cpu()  # [C-1]
+        hd95_per_class = hd95_per_class.detach().float().cpu()
     else:
         hd95_per_class = torch.full((max(num_classes - 1, 0),), float("nan"), dtype=torch.float32)
-
     dice_mean_incl_bg = float(torch.nanmean(dice_per_class).item())
     dice_mean_fg = float(torch.nanmean(dice_per_class[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
+    iou_mean_incl_bg = float(torch.nanmean(iou_per_class).item())
+    iou_mean_fg = float(torch.nanmean(iou_per_class[1:]).item()) if num_classes > 1 else iou_mean_incl_bg
     hd95_mean_excl_bg = float(torch.nanmean(hd95_per_class).item()) if hd95_per_class.numel() > 0 else float("nan")
-
     if writer is not None:
         writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
         writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_fg", iou_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_incl_bg", iou_mean_incl_bg, global_step)
         if compute_hd95:
             writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
-
         for c in range(num_classes):
-            writer.add_scalar(
-                f"{prefix}/per_class_dice/{class_names[c]}",
-                float(dice_per_class[c].item()),
-                global_step,
-            )
-
+            writer.add_scalar(f"{prefix}/per_class_dice/{class_names[c]}", float(dice_per_class[c].item()), global_step)
+            writer.add_scalar(f"{prefix}/per_class_iou/{class_names[c]}", float(iou_per_class[c].item()), global_step)
         if compute_hd95:
             for idx in range(hd95_per_class.numel()):
-                writer.add_scalar(
-                    f"{prefix}/per_class_hd95/{class_names[idx + 1]}",
-                    float(hd95_per_class[idx].item()),
-                    global_step,
-                )
-
+                writer.add_scalar(f"{prefix}/per_class_hd95/{class_names[idx + 1]}", float(hd95_per_class[idx].item()), global_step)
     return {
         "dice_mean_incl_bg": dice_mean_incl_bg,
         "dice_mean_fg": dice_mean_fg,
+        "iou_mean_incl_bg": iou_mean_incl_bg,
+        "iou_mean_fg": iou_mean_fg,
         "hd95_mean_excl_bg": hd95_mean_excl_bg,
         "dice_per_class_incl_bg": dice_per_class,
+        "iou_per_class_incl_bg": iou_per_class,
         "hd95_per_class_excl_bg": hd95_per_class,
     }
 
@@ -714,12 +801,13 @@ def run_test_ensemble_and_print_cases(
     writer: Optional[SummaryWriter] = None,
     prefix: str = "test",
     compute_hd95: bool = True,
+    default_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> Dict[str, Any]:
     assert len(ckpt_paths) > 0, "ckpt_paths is empty"
-
     sum_dice = torch.zeros((num_classes,), dtype=torch.float64)
     cnt_dice = torch.zeros((num_classes,), dtype=torch.float64)
-
+    sum_iou = torch.zeros((num_classes,), dtype=torch.float64)
+    cnt_iou = torch.zeros((num_classes,), dtype=torch.float64)
     hd95_metric = None
     if compute_hd95:
         hd95_metric = HausdorffDistanceMetric(
@@ -728,21 +816,24 @@ def run_test_ensemble_and_print_cases(
             percentile=95,
             get_not_nans=True,
         )
-
     case_rows: List[Dict[str, Any]] = []
-
     pbar = tqdm(loader, desc=f"{prefix.upper()}(ens{len(ckpt_paths)})@{global_step}", dynamic_ncols=True)
-    for batch in pbar:
-        case_id = _get_case_id(batch)
+    for batch_idx, batch in enumerate(pbar):
+        fallback_case_id = ""
+        if hasattr(loader, "dataset") and batch_idx < len(loader.dataset):
+            sample = loader.dataset.data[batch_idx]
+            fallback_case_id = str(sample.get("image", "") or sample.get("label", "") or "")
+        case_path, case_number = _get_case_info(batch, fallback_case_id=fallback_case_id)
+        case_index = batch_idx
         inputs = batch["image"].to(device)
         labels = batch["label"].to(device)
-
         logits_sum = None
         for p in ckpt_paths:
             sd = torch.load(p, map_location=device)
+            if isinstance(sd, dict) and "model" in sd:
+                sd = sd["model"]
             model.load_state_dict(sd, strict=True)
             model.eval()
-
             out = sliding_window_inference(
                 inputs,
                 roi_size=roi_size,
@@ -752,44 +843,50 @@ def run_test_ensemble_and_print_cases(
                 mode="gaussian",
             )
             logits_sum = out if logits_sum is None else (logits_sum + out)
-
         logits = logits_sum / float(len(ckpt_paths))
-
         labels_list = decollate_batch(labels)
         labels_1hot_list = [post_label(x) for x in labels_list]
-
         logits_list = decollate_batch(logits)
         preds_1hot_list = [post_pred(x) for x in logits_list]
-
         dice_c = dice_per_class_onehot(preds_1hot_list[0], labels_1hot_list[0], ignore_empty=True)
+        iou_c = iou_per_class_onehot(preds_1hot_list[0], labels_1hot_list[0], ignore_empty=True)
         dice_fg = float(torch.nanmean(dice_c[1:]).item()) if num_classes > 1 else float(torch.nanmean(dice_c).item())
-
+        iou_fg = float(torch.nanmean(iou_c[1:]).item()) if num_classes > 1 else float(torch.nanmean(iou_c).item())
         dice_c_cpu = dice_c.detach().cpu().double()
-        mask = ~torch.isnan(dice_c_cpu)
+        iou_c_cpu = iou_c.detach().cpu().double()
+        dice_mask = ~torch.isnan(dice_c_cpu)
+        iou_mask = ~torch.isnan(iou_c_cpu)
         sum_dice += torch.nan_to_num(dice_c_cpu, nan=0.0)
-        cnt_dice += mask.double()
-
+        cnt_dice += dice_mask.double()
+        sum_iou += torch.nan_to_num(iou_c_cpu, nan=0.0)
+        cnt_iou += iou_mask.double()
         if hd95_metric is not None:
-            hd95_metric(y_pred=preds_1hot_list, y=labels_1hot_list)
-
+            spacing = _get_spacing_for_batch(batch, len(preds_1hot_list), default_spacing)
+            hd95_metric(y_pred=preds_1hot_list, y=labels_1hot_list, spacing=spacing)
         case_rows.append(
             {
-                "case_id": case_id,
+                "case_index": int(case_index),
+                "case_number": case_number if case_number else "unknown_case_number",
+                "case_id": case_path,
                 "dice_mean_fg": dice_fg,
+                "iou_mean_fg": iou_fg,
                 "dice_per_class_incl_bg": tensor_to_float_list(dice_c.detach().cpu().float()),
+                "iou_per_class_incl_bg": tensor_to_float_list(iou_c.detach().cpu().float()),
             }
         )
-
-        pbar.set_postfix({"case_fg_dice": f"{dice_fg:.4f}"})
-
+        pbar.set_postfix({"case_fg_dice": f"{dice_fg:.4f}", "case_fg_iou": f"{iou_fg:.4f}"})
     dice_per_class_mean = torch.full((num_classes,), float("nan"), dtype=torch.float64)
-    valid = cnt_dice > 0
-    dice_per_class_mean[valid] = sum_dice[valid] / cnt_dice[valid]
+    iou_per_class_mean = torch.full((num_classes,), float("nan"), dtype=torch.float64)
+    valid_dice = cnt_dice > 0
+    valid_iou = cnt_iou > 0
+    dice_per_class_mean[valid_dice] = sum_dice[valid_dice] / cnt_dice[valid_dice]
+    iou_per_class_mean[valid_iou] = sum_iou[valid_iou] / cnt_iou[valid_iou]
     dice_per_class_mean_f32 = dice_per_class_mean.float()
-
+    iou_per_class_mean_f32 = iou_per_class_mean.float()
     dice_mean_incl_bg = float(torch.nanmean(dice_per_class_mean_f32).item())
     dice_mean_fg = float(torch.nanmean(dice_per_class_mean_f32[1:]).item()) if num_classes > 1 else dice_mean_incl_bg
-
+    iou_mean_incl_bg = float(torch.nanmean(iou_per_class_mean_f32).item())
+    iou_mean_fg = float(torch.nanmean(iou_per_class_mean_f32[1:]).item()) if num_classes > 1 else iou_mean_incl_bg
     if hd95_metric is not None:
         hd_agg = hd95_metric.aggregate()
         hd95_metric.reset()
@@ -800,47 +897,39 @@ def run_test_ensemble_and_print_cases(
         determine = max(num_classes - 1, 0)
         hd95_per_class = torch.full((determine,), float("nan"), dtype=torch.float32)
         hd95_mean_excl_bg = float("nan")
-
     case_rows_sorted = sorted(case_rows, key=lambda r: r["dice_mean_fg"])
     dices = np.array([r["dice_mean_fg"] for r in case_rows_sorted], dtype=np.float32)
     mean_fg = float(np.mean(dices)) if dices.size > 0 else float("nan")
     std_fg = float(np.std(dices)) if dices.size > 0 else float("nan")
     thresh = mean_fg - 2.0 * std_fg if (not math.isnan(mean_fg) and not math.isnan(std_fg)) else float("-inf")
-
     print("\n================ TEST CASES (sorted by fg Dice) ================")
     print(f"Ensemble ckpts: {len(ckpt_paths)}")
     print(f"Case fgDice mean={mean_fg:.6f} std={std_fg:.6f} | outlier<thr={thresh:.6f}\n")
     for i, r in enumerate(case_rows_sorted):
         flag = "  <-- OUTLIER" if (r["dice_mean_fg"] < thresh) else ""
-        print(f"[{i:02d}] fgDice={r['dice_mean_fg']:.6f} | {r['case_id']}{flag}")
+        print(f"[{i:02d}] dataset_idx={r['case_index']:03d} | case_no={r['case_number']} | fgDice={r['dice_mean_fg']:.6f} | fgIoU={r['iou_mean_fg']:.6f} | {r['case_id']}{flag}")
     print("===============================================================\n")
-
     if writer is not None:
         writer.add_scalar(f"{prefix}/dice_mean_fg", dice_mean_fg, global_step)
         writer.add_scalar(f"{prefix}/dice_mean_incl_bg", dice_mean_incl_bg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_fg", iou_mean_fg, global_step)
+        writer.add_scalar(f"{prefix}/iou_mean_incl_bg", iou_mean_incl_bg, global_step)
         if compute_hd95:
             writer.add_scalar(f"{prefix}/hd95_mean_excl_bg", hd95_mean_excl_bg, global_step)
-
         for c in range(num_classes):
-            writer.add_scalar(
-                f"{prefix}/per_class_dice/{class_names[c]}",
-                float(dice_per_class_mean_f32[c].item()) if not torch.isnan(dice_per_class_mean_f32[c]) else float("nan"),
-                global_step,
-            )
-
+            writer.add_scalar(f"{prefix}/per_class_dice/{class_names[c]}", float(dice_per_class_mean_f32[c].item()) if not torch.isnan(dice_per_class_mean_f32[c]) else float("nan"), global_step)
+            writer.add_scalar(f"{prefix}/per_class_iou/{class_names[c]}", float(iou_per_class_mean_f32[c].item()) if not torch.isnan(iou_per_class_mean_f32[c]) else float("nan"), global_step)
         if compute_hd95:
             for idx in range(hd95_per_class.numel()):
-                writer.add_scalar(
-                    f"{prefix}/per_class_hd95/{class_names[idx + 1]}",
-                    float(hd95_per_class[idx].item()),
-                    global_step,
-                )
-
+                writer.add_scalar(f"{prefix}/per_class_hd95/{class_names[idx + 1]}", float(hd95_per_class[idx].item()), global_step)
     return {
         "dice_mean_incl_bg": dice_mean_incl_bg,
         "dice_mean_fg": dice_mean_fg,
+        "iou_mean_incl_bg": iou_mean_incl_bg,
+        "iou_mean_fg": iou_mean_fg,
         "hd95_mean_excl_bg": hd95_mean_excl_bg,
         "dice_per_class_incl_bg": dice_per_class_mean_f32,
+        "iou_per_class_incl_bg": iou_per_class_mean_f32,
         "hd95_per_class_excl_bg": hd95_per_class,
         "case_rows": case_rows_sorted,
         "ensemble_ckpts": ckpt_paths,
@@ -850,22 +939,22 @@ def run_test_ensemble_and_print_cases(
 def main():
     args = parse_args()
 
-    # ----------------------------
-    # Output dir
-    # ----------------------------
+                                  
+                
+                                  
     run_id = args.run_name.strip() if args.run_name.strip() else datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(args.output_root, f"btcv_run_{run_id}")
     os.makedirs(output_dir, exist_ok=True)
     print("output_dir =", output_dir)
 
-    # ----------------------------
-    # Save CODE SNAPSHOT
-    # ----------------------------
+                                  
+                        
+                                  
     save_code_snapshot(output_dir=output_dir, extra_rel_paths=list(args.snapshot_extra))
 
-    # ----------------------------
-    # MONAI temp/cache dir
-    # ----------------------------
+                                  
+                          
+                                  
     print_config()
     directory = os.environ.get("MONAI_DATA_DIRECTORY")
     if directory is not None:
@@ -873,24 +962,24 @@ def main():
     root_dir = tempfile.mkdtemp() if directory is None else directory
     print("MONAI root_dir =", root_dir)
 
-    # ----------------------------
-    # Device
-    # ----------------------------
+                                  
+            
+                                  
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device =", device)
 
-    # ----------------------------
-    # Repro
-    # ----------------------------
+                                  
+           
+                                  
     seed_everything(args.seed)
     if args.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
         print("[WARN] cudnn_benchmark=True may reduce reproducibility even with fixed seeds.")
 
-    # ----------------------------
-    # Config
-    # ----------------------------
+                                  
+            
+                                  
     json_path = os.path.join(args.data_dir, args.split_json)
 
     pixdim = tuple(args.pixdim)
@@ -898,11 +987,11 @@ def main():
     num_classes = int(args.num_classes)
     class_names = get_class_names(num_classes)
 
-    # ----------------------------
-    # Split priority:
-    # 1) use predefined training/validation/test from json when available
-    # 2) fallback to random split from pool_keys
-    # ----------------------------
+                                  
+                     
+                                                                         
+                                                
+                                  
     with open(json_path, "r", encoding="utf-8") as f:
         json_meta = json.load(f)
 
@@ -938,7 +1027,7 @@ def main():
             json_path=json_path,
             pool_keys=args.pool_keys,
             train_num=args.train_num,
-            val_num=0,  # critical
+            val_num=0,            
             test_num=args.test_num,
             split_seed=args.split_seed,
             exclude_cases=args.exclude_cases,
@@ -954,7 +1043,7 @@ def main():
     print("=======================================\n")
     val_files = _fix_split_pair_paths(val_files, split_name="val")
     test_files = _fix_split_pair_paths(test_files, split_name="test")
-    # write config.json
+                       
     cfg = vars(args).copy()
     cfg.update(
         {
@@ -968,8 +1057,9 @@ def main():
             "best_selection_metric": "val/dice_mean_fg (foreground only)",
             "early_stop_metric": "val/dice_mean_fg (foreground only)",
             "test_report_metrics": [
-                "test/dice_mean_fg (foreground only, ensemble logits avg)",
-                "test/hd95_mean_excl_bg (foreground only, ensemble logits avg)",
+                "test/dice_mean_fg (foreground only)",
+                "test/iou_mean_fg (foreground only)",
+                "test/hd95_mean_excl_bg (foreground only, spacing-aware)",
             ],
             "sw_infer_mode": "gaussian",
             "exclude_cases": list(args.exclude_cases),
@@ -987,24 +1077,23 @@ def main():
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
 
-    # ----------------------------
-    # TensorBoard
-    # ----------------------------
+                                  
+                 
+                                  
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
     writer.add_text("meta/output_dir", output_dir, 0)
     writer.add_text("meta/json_path", json_path, 0)
     writer.add_text("meta/sw_infer_mode", "gaussian", 0)
     writer.add_text("meta/sw_overlap", str(args.sw_overlap), 0)
-    writer.add_text("meta/topk", str(args.topk), 0)
     writer.add_text("meta/save_ckpt_every", str(args.save_ckpt_every), 0)
     writer.add_text("meta/exclude_cases", ",".join(list(args.exclude_cases)) if args.exclude_cases else "", 0)
     writer.add_text("meta/code_snapshot_dir", os.path.join(output_dir, "snapshot"), 0)
     writer.add_text("meta/val_source", val_source, 0)
     writer.add_text("meta/val_start_iter", str(args.val_start_iter), 0)
 
-    # ----------------------------
-    # Transforms
-    # ----------------------------
+                                  
+                
+                                  
     train_transforms = Compose(
         [
             LoadImaged(keys=["image", "label"]),
@@ -1071,9 +1160,9 @@ def main():
         ]
     )
 
-    # ----------------------------
-    # save lists
-    # ----------------------------
+                                  
+                
+                                  
     train_list_path = os.path.join(output_dir, "train_files_list.json")
     val_list_path = os.path.join(output_dir, "val_files_list.json")
     test_list_path = os.path.join(output_dir, "test_files_list.json")
@@ -1084,15 +1173,15 @@ def main():
     with open(test_list_path, "w") as f:
         json.dump(test_files, f, indent=2)
 
-    # ----------------------------
-    # DataLoader reproducibility
-    # ----------------------------
+                                  
+                                
+                                  
     g = torch.Generator()
     g.manual_seed(args.seed)
 
-    # ----------------------------
-    # Train dataset/loader (build immediately)
-    # ----------------------------
+                                  
+                                              
+                                  
     cache_num_train = len(train_files) if args.cache_num_train <= 0 else min(args.cache_num_train, len(train_files))
     train_ds = CacheDataset(
         data=train_files,
@@ -1113,9 +1202,9 @@ def main():
         generator=g,
     )
 
-    # ----------------------------
-    # NEW: val/test dataset/loader are lazy-built
-    # ----------------------------
+                                  
+                                                 
+                                  
     val_ds = None
     val_loader = None
     test_ds = None
@@ -1128,7 +1217,7 @@ def main():
         nonlocal val_ds, val_loader
         if val_loader is not None:
             return val_loader
-        # build val cache only when needed
+                                          
         val_ds = CacheDataset(
             data=val_files,
             transform=eval_transforms,
@@ -1154,7 +1243,7 @@ def main():
         if test_loader is not None:
             return test_loader
 
-        # if val=test and val_loader already exists and settings match, reuse it
+                                                                                
         if (
             (val_source == "test_as_val")
             and (val_loader is not None)
@@ -1166,7 +1255,7 @@ def main():
             print("[TEST] reuse val_loader as test_loader (val=test)")
             return test_loader
 
-        # otherwise build test loader lazily
+                                            
         test_ds = CacheDataset(
             data=test_files,
             transform=eval_transforms,
@@ -1205,26 +1294,26 @@ def main():
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
-    # --- param groups: decay vs no_decay (bias/norm excluded) ---
+                                                                  
     param_groups = build_param_groups(model, weight_decay=float(args.wd))
 
-    # --- SGD (scheme B): weight_decay is controlled per param_group ---
+                                                                        
     optimizer = torch.optim.SGD(
         param_groups,
         lr=float(args.lr),
         momentum=float(args.momentum),
     )
 
-    # PolyLR scheduler (iteration-based)
+                                        
     scheduler = None
     if args.use_poly:
         base_lr = float(args.lr)
 
         def lr_lambda(step: int):
-            # step: 0,1,2,... (per optimizer update)
+                                                    
             t = min(max(step, 0), int(args.max_iterations))
             poly = (1.0 - t / float(args.max_iterations)) ** float(args.poly_power)
-            # clamp to min_lr
+                             
             return max(float(args.min_lr) / base_lr, poly)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -1234,58 +1323,18 @@ def main():
 
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
-
-    topk = max(1, int(args.topk))
-    topk_dir = os.path.join(output_dir, f"top{topk}")
-    os.makedirs(topk_dir, exist_ok=True)
-    topk_list: List[Tuple[float, int, str]] = []  # (dice_fg, step, path)
-
     periodic_ckpt_dir = os.path.join(output_dir, "periodic_checkpoints")
     os.makedirs(periodic_ckpt_dir, exist_ok=True)
-
     best_path = os.path.join(output_dir, "best.pt")
     last_resume_path = os.path.join(output_dir, "last_resume.pt")
-
     global_step = 0
     best_val_dice_fg = -1.0
     best_step = -1
-
     eval_history: List[Dict[str, Any]] = []
     num_evals = 0
     bad_evals = 0
     stop_training = False
     early_stop_reason = ""
-
-
-    def maybe_update_topk(dice_fg: float, step: int) -> None:
-        nonlocal topk_list
-        qualifies = (len(topk_list) < topk) or (dice_fg > topk_list[-1][0])
-        if not qualifies:
-            return
-
-        ckpt_path = os.path.join(topk_dir, f"iter{step:06d}_dice{dice_fg:.6f}.pt")
-        # 保持为 model-only，保证现有 test ensemble 逻辑兼容
-        torch.save(model.state_dict(), ckpt_path)
-
-        topk_list.append((float(dice_fg), int(step), ckpt_path))
-        topk_list.sort(key=lambda x: x[0], reverse=True)
-
-        if len(topk_list) > topk:
-            for _, _, p in topk_list[topk:]:
-                try:
-                    if os.path.isfile(p):
-                        os.remove(p)
-                except Exception:
-                    pass
-            topk_list = topk_list[:topk]
-
-        with open(os.path.join(output_dir, "topk_checkpoints.json"), "w") as f:
-            json.dump(
-                [{"rank": i + 1, "dice_fg": s, "iter": it, "path": p} for i, (s, it, p) in enumerate(topk_list)],
-                f,
-                indent=2,
-            )
-
 
     def _build_full_training_checkpoint(step: int) -> Dict[str, Any]:
         ckpt = {
@@ -1300,7 +1349,6 @@ def main():
             "num_evals": int(num_evals),
             "bad_evals": int(bad_evals),
             "early_stop_reason": str(early_stop_reason),
-            "topk_list": [(float(s), int(it), str(p)) for (s, it, p) in topk_list],
             "args": vars(args),
             "rng_state": {
                 "python": random.getstate(),
@@ -1312,68 +1360,41 @@ def main():
         }
         return ckpt
 
-
     def save_periodic_checkpoint(step: int) -> None:
-        # 1) 保存带 iter 编号的完整恢复点
         ckpt_path = os.path.join(periodic_ckpt_dir, f"iter{step:06d}.pt")
         torch.save(_build_full_training_checkpoint(step), ckpt_path)
         print(f"[SAVE] periodic full checkpoint @ iter={step} -> {ckpt_path}")
-
-        # 2) 同时覆盖保存一个“最近恢复点”
         torch.save(_build_full_training_checkpoint(step), last_resume_path)
         print(f"[SAVE] last resume checkpoint updated -> {last_resume_path}")
 
-
     def try_resume_from_checkpoint(resume_path: str) -> None:
         nonlocal global_step, best_val_dice_fg, best_step
-        nonlocal eval_history, num_evals, bad_evals, early_stop_reason, topk_list
-
+        nonlocal eval_history, num_evals, bad_evals, early_stop_reason
         if not resume_path:
             return
         if not os.path.isfile(resume_path):
             raise FileNotFoundError(f"--resume file not found: {resume_path}")
-
         print(f"[RESUME] loading full checkpoint from: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
-
         if "model" not in ckpt:
             raise ValueError(
                 "The resume checkpoint does not contain key 'model'. "
                 "It looks like a model-only checkpoint, not a full training checkpoint."
             )
-
         model.load_state_dict(ckpt["model"], strict=True)
-
         if "optimizer" in ckpt and ckpt["optimizer"] is not None:
             optimizer.load_state_dict(ckpt["optimizer"])
-
         if scheduler is not None and ckpt.get("scheduler") is not None:
             scheduler.load_state_dict(ckpt["scheduler"])
-
         if scaler is not None and ckpt.get("scaler") is not None:
             scaler.load_state_dict(ckpt["scaler"])
-
         global_step = int(ckpt.get("iter", 0))
         best_val_dice_fg = float(ckpt.get("best_val_dice_fg", -1.0))
         best_step = int(ckpt.get("best_step", -1))
-
         eval_history = list(ckpt.get("eval_history", []))
         num_evals = int(ckpt.get("num_evals", 0))
         bad_evals = int(ckpt.get("bad_evals", 0))
         early_stop_reason = str(ckpt.get("early_stop_reason", ""))
-
-        raw_topk = ckpt.get("topk_list", [])
-        restored_topk: List[Tuple[float, int, str]] = []
-        for item in raw_topk:
-            if isinstance(item, (list, tuple)) and len(item) == 3:
-                s, it, p = item
-                p = str(p)
-                # 只保留当前仍存在的 topk 文件
-                if os.path.isfile(p):
-                    restored_topk.append((float(s), int(it), p))
-        restored_topk.sort(key=lambda x: x[0], reverse=True)
-        topk_list = restored_topk[:topk]
-
         rng_state = ckpt.get("rng_state", {})
         try:
             if "python" in rng_state and rng_state["python"] is not None:
@@ -1388,15 +1409,12 @@ def main():
                 g.set_state(rng_state["loader_generator"])
         except Exception as e:
             print(f"[RESUME][WARN] failed to fully restore RNG state: {type(e).__name__}: {e}")
-
         print(
             f"[RESUME] success | iter={global_step} | "
             f"best_val_dice_fg={best_val_dice_fg:.6f} | best_step={best_step} | "
-            f"num_evals={num_evals} | bad_evals={bad_evals} | topk_kept={len(topk_list)}"
+            f"num_evals={num_evals} | bad_evals={bad_evals}"
         )
 
-
-    # 如果指定 --resume，则恢复训练状态
     if args.resume.strip():
         try_resume_from_checkpoint(args.resume.strip())
 
@@ -1420,11 +1438,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                # 深监督已移除：模型只返回主输出 logits
+                                        
                 logits = model(x)
                 loss = loss_function(logits, y)
 
-            # 只记录主损失（保留你的loss_total命名，避免TensorBoard曲线断档）
+                                                        
             writer.add_scalar("train/loss_total", float(loss.item()), global_step)
 
             scaler.scale(loss).backward()
@@ -1448,7 +1466,6 @@ def main():
             do_eval_now = ((global_step % args.eval_num == 0) or (global_step == args.max_iterations))
             if do_eval_now and (global_step >= int(args.val_start_iter)):
                 prev_best = float(best_val_dice_fg)
-
                 vloader = ensure_val_loader()
                 val_res = run_evaluation_single_model(
                     model=model,
@@ -1465,50 +1482,39 @@ def main():
                     writer=writer,
                     prefix="val",
                     compute_hd95=False,
+                    default_spacing=pixdim,
                 )
                 model.train()
                 dice_fg = float(val_res["dice_mean_fg"])
                 dice_incl_bg = float(val_res["dice_mean_incl_bg"])
-
+                iou_fg = float(val_res["iou_mean_fg"])
                 eval_history.append(
                     {
                         "iter": int(global_step),
                         "train_loss_at_eval": float(loss.item()),
                         "val_dice_mean_fg": safe_float(dice_fg),
                         "val_dice_mean_incl_bg": safe_float(dice_incl_bg),
+                        "val_iou_mean_fg": safe_float(iou_fg),
+                        "val_iou_per_class_incl_bg": tensor_to_float_list(val_res["iou_per_class_incl_bg"]),
                         "val_source": val_source,
                         "val_dice_per_class_incl_bg": tensor_to_float_list(val_res["dice_per_class_incl_bg"]),
                     }
                 )
-
-                maybe_update_topk(dice_fg=dice_fg, step=global_step)
-
                 if dice_fg > best_val_dice_fg:
                     best_val_dice_fg = float(dice_fg)
                     best_step = int(global_step)
                     torch.save(model.state_dict(), best_path)
-                    print(
-                        f"[SAVE] best.pt @ iter={best_step} | best_val_dice_fg={best_val_dice_fg:.4f} "
-                        f"| val_dice_incl_bg={dice_incl_bg:.4f}"
-                    )
+                    print(f"[SAVE] best.pt @ iter={best_step} | best_val_dice_fg={best_val_dice_fg:.4f} | val_dice_incl_bg={dice_incl_bg:.4f} | val_iou_fg={iou_fg:.4f}")
                 else:
-                    print(
-                        f"[NOSAVE] best_val_dice_fg={best_val_dice_fg:.4f} | current_val_dice_fg={dice_fg:.4f} "
-                        f"| val_dice_incl_bg={dice_incl_bg:.4f}"
-                    )
-
-                # early stop logic
+                    print(f"[NOSAVE] best_val_dice_fg={best_val_dice_fg:.4f} | current_val_dice_fg={dice_fg:.4f} | val_dice_incl_bg={dice_incl_bg:.4f} | val_iou_fg={iou_fg:.4f}")
                 num_evals += 1
-                improved_for_early_stop = (dice_fg > (prev_best + args.early_stop_min_delta))
+                improved_for_early_stop = dice_fg > (prev_best + args.early_stop_min_delta)
                 if improved_for_early_stop:
                     bad_evals = 0
-                else:
-                    if num_evals > args.early_stop_warmup:
-                        bad_evals += 1
-
+                elif num_evals > args.early_stop_warmup:
+                    bad_evals += 1
                 writer.add_scalar("train/early_stop_bad_evals", bad_evals, global_step)
                 writer.add_scalar("train/best_val_dice_mean_fg", float(best_val_dice_fg), global_step)
-
                 if (num_evals > args.early_stop_warmup) and (bad_evals >= args.early_stop_patience):
                     stop_training = True
                     early_stop_reason = (
@@ -1528,12 +1534,7 @@ def main():
         print(f"Stopped early at iter={global_step}. Reason: {early_stop_reason}")
         torch.save(_build_full_training_checkpoint(global_step), last_resume_path)
         print(f"[SAVE] final last resume checkpoint -> {last_resume_path}")
-    test_metrics: Dict[str, Any] = {}
-
-    ckpt_paths = [p for (_, _, p) in topk_list if os.path.isfile(p)]
-    if len(ckpt_paths) == 0 and os.path.isfile(best_path):
-        ckpt_paths = [best_path]
-
+    ckpt_paths = [best_path] if os.path.isfile(best_path) else []
     if len(ckpt_paths) > 0:
         tloader = ensure_test_loader()
         test_res = run_test_ensemble_and_print_cases(
@@ -1552,87 +1553,93 @@ def main():
             writer=writer,
             prefix="test",
             compute_hd95=True,
+            default_spacing=pixdim,
         )
-
         test_dice_fg = float(test_res["dice_mean_fg"])
+        test_iou_fg = float(test_res["iou_mean_fg"])
         test_hd95 = float(test_res["hd95_mean_excl_bg"])
         dice_pc = test_res["dice_per_class_incl_bg"]
+        iou_pc = test_res["iou_per_class_incl_bg"]
         hd_pc = test_res["hd95_per_class_excl_bg"]
-
-        print("\n================ TEST (top-k ensemble) ================")
+        print("\n================ TEST ================")
         print(f"best_iter                 : {best_step}")
         print(f"best_val_dice_fg          : {best_val_dice_fg:.6f}")
         print(f"TEST dice_mean_fg         : {test_dice_fg:.6f}")
+        print(f"TEST iou_mean_fg          : {test_iou_fg:.6f}")
         print(f"TEST hd95_mean_excl_bg    : {test_hd95:.6f}")
-        print("=======================================================\n")
-
-        print("Per-class Dice (incl bg, mean-over-cases):")
+        print("======================================\n")
+        print("Per-class Dice and IoU (incl bg, mean-over-cases):")
         for c in range(num_classes):
-            v = float(dice_pc[c].item()) if not torch.isnan(dice_pc[c]) else float("nan")
-            print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
-
+            dice_v = float(dice_pc[c].item()) if not torch.isnan(dice_pc[c]) else float("nan")
+            iou_v = float(iou_pc[c].item()) if not torch.isnan(iou_pc[c]) else float("nan")
+            print(f"  [{c:02d}] {class_names[c]:>18s} : Dice={dice_v:.6f} | IoU={iou_v:.6f}")
         print("\nPer-class HD95 (excl bg):")
         for c in range(1, num_classes):
             idx = c - 1
             if idx < hd_pc.numel():
                 v = float(hd_pc[idx].item())
-                print(f"  [{c:02d}] {class_names[c]:>10s} : {v:.6f}")
-
-        test_metrics = {
-            "ensemble_ckpts": ckpt_paths,
-            "ensemble_k": int(len(ckpt_paths)),
-            "best_path": best_path if os.path.isfile(best_path) else "",
-            "best_iter": int(best_step),
-            "best_selection_metric": "val/dice_mean_fg (foreground only)",
-            "best_val_dice_mean_fg": safe_float(best_val_dice_fg),
-            "test_metric_definition": "dice_mean_fg = mean Dice over classes 1..C-1 (mean-over-cases per class, ignore empty)",
-            "test_dice_mean_fg": safe_float(test_dice_fg),
-            "test_hd95_mean_excl_bg": safe_float(test_hd95),
-            "test_dice_per_class_incl_bg": tensor_to_float_list(dice_pc),
-            "test_hd95_per_class_excl_bg": tensor_to_float_list(hd_pc),
-            "test_case_rows_sorted_by_fg_dice": test_res["case_rows"],
-            "class_names": class_names,
-            "class_labels": CLASS_LABELS,
-            "early_stopped": bool(stop_training),
-            "early_stop_reason": early_stop_reason,
-            "early_stop_patience": int(args.early_stop_patience),
-            "early_stop_min_delta": float(args.early_stop_min_delta),
-            "early_stop_warmup": int(args.early_stop_warmup),
-            "val_start_iter": int(args.val_start_iter),
-            "split": {
-                "pool_keys": list(args.pool_keys),
-                "train_num_arg": int(args.train_num),
-                "val_num_arg": int(args.val_num),
-                "test_num_arg": int(args.test_num),
-                "val_separate": bool(args.val_separate),
+                print(f"  [{c:02d}] {class_names[c]:>18s} : {v:.6f}")
+        summary_csv = os.path.join(output_dir, "test_metrics_summary.csv")
+        per_class_csv = os.path.join(output_dir, "test_metrics_per_class.csv")
+        per_case_csv = os.path.join(output_dir, "test_metrics_per_case.csv")
+        write_dict_rows_to_csv(
+            summary_csv,
+            [{
+                "best_path": best_path if os.path.isfile(best_path) else "",
+                "best_iter": int(best_step),
+                "best_val_dice_mean_fg": safe_float(best_val_dice_fg),
+                "test_dice_mean_fg": safe_float(test_dice_fg),
+                "test_iou_mean_fg": safe_float(test_iou_fg),
+                "test_hd95_mean_excl_bg": safe_float(test_hd95),
+                "early_stopped": bool(stop_training),
+                "early_stop_reason": early_stop_reason,
                 "val_source": val_source,
-                "split_seed": int(args.split_seed),
-                "exclude_cases": list(args.exclude_cases),
-                "train_size": int(len(train_files)),
-                "val_size": int(len(val_files)),
                 "test_size": int(len(test_files)),
-            },
-            "sw_infer": {"mode": "gaussian", "overlap": float(args.sw_overlap)},
-        }
-
-        with open(os.path.join(output_dir, "test_metrics.json"), "w") as f:
-            json.dump(test_metrics, f, indent=2)
+            }],
+            ["best_path", "best_iter", "best_val_dice_mean_fg", "test_dice_mean_fg", "test_iou_mean_fg", "test_hd95_mean_excl_bg", "early_stopped", "early_stop_reason", "val_source", "test_size"],
+        )
+        per_class_rows = []
+        for c in range(num_classes):
+            row = {
+                "class_index": c,
+                "class_name": class_names[c],
+                "dice": safe_float(float(dice_pc[c].item())) if not torch.isnan(dice_pc[c]) else None,
+                "iou": safe_float(float(iou_pc[c].item())) if not torch.isnan(iou_pc[c]) else None,
+                "hd95": "",
+            }
+            if c > 0 and (c - 1) < hd_pc.numel() and not torch.isnan(hd_pc[c - 1]):
+                row["hd95"] = safe_float(float(hd_pc[c - 1].item()))
+            per_class_rows.append(row)
+        write_dict_rows_to_csv(per_class_csv, per_class_rows, ["class_index", "class_name", "dice", "iou", "hd95"])
+        per_case_rows = []
+        for row in test_res["case_rows"]:
+            out_row = {
+                "case_index": row["case_index"],
+                "case_number": row["case_number"],
+                "case_id": row["case_id"],
+                "dice_mean_fg": safe_float(row["dice_mean_fg"]),
+                "iou_mean_fg": safe_float(row["iou_mean_fg"]),
+            }
+            for c, class_name in enumerate(class_names):
+                out_row[f"dice_{class_name}"] = row["dice_per_class_incl_bg"][c]
+                out_row[f"iou_{class_name}"] = row["iou_per_class_incl_bg"][c]
+            per_case_rows.append(out_row)
+        per_case_fields = ["case_index", "case_number", "case_id", "dice_mean_fg", "iou_mean_fg"] + [f"dice_{name}" for name in class_names] + [f"iou_{name}" for name in class_names]
+        write_dict_rows_to_csv(per_case_csv, per_case_rows, per_case_fields)
     else:
-        print(f"[WARN] No checkpoints found for testing. topk_dir={topk_dir} best_path={best_path}")
-
+        print(f"[WARN] No checkpoints found for testing. best_path={best_path}")
     with open(os.path.join(output_dir, "eval_history.json"), "w") as f:
         json.dump(eval_history, f, indent=2)
-
     writer.close()
-
     print("\nSaved artifacts:")
     print(" -", os.path.join(output_dir, "config.json"))
     print(" -", os.path.join(output_dir, "tb"))
     print(" -", os.path.join(output_dir, "snapshot"))
     print(" -", best_path)
     print(" -", periodic_ckpt_dir)
-    print(" -", os.path.join(output_dir, "topk_checkpoints.json"))
-    print(" -", os.path.join(output_dir, "test_metrics.json"))
+    print(" -", os.path.join(output_dir, "test_metrics_summary.csv"))
+    print(" -", os.path.join(output_dir, "test_metrics_per_class.csv"))
+    print(" -", os.path.join(output_dir, "test_metrics_per_case.csv"))
     print(" -", os.path.join(output_dir, "eval_history.json"))
     print(" -", os.path.join(output_dir, "train_files_list.json"))
     print(" -", os.path.join(output_dir, "val_files_list.json"))
